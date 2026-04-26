@@ -83,7 +83,154 @@ Under local vol, the spot path has no closed-form distribution, so we discretize
 - **Antithetic variates** — for each Brownian draw $Z$ we also use $-Z$, halving the noise from symmetric paths essentially for free.
 - **Geometric Asian control variate** — the *geometric* average $\bigl(\prod S_{t_i}\bigr)^{1/N}$ has a Black-Scholes-style closed-form price under GBM (Kemna & Vorst, 1990). Its MC realization is highly correlated (typically $\rho > 0.99$) with the arithmetic average. We subtract the regression-adjusted geometric MC error from the arithmetic estimate, often shrinking standard error by **5-20×** at the same path count.
 
-The CV target uses a flat ATM vol, so it is not strictly unbiased under local vol; the package reports the bias proxy $\bar{A}_{\mathrm{geom}}^{\mathrm{MC}} - C_{\mathrm{geom}}^{\mathrm{exact}}$ alongside the price.
+The CV target uses a flat ATM vol, so it is not strictly unbiased under local vol; the package reports the bias proxy $\bar{A}_{\mathrm{geom}}^{\mathrm{MC}} - C_{\mathrm{geom}}^{\mathrm{exact}}$ alongside the price so you can size the residual error.
+
+---
+
+## How it works
+
+Each pipeline stage maps 1-to-1 onto a module in `spy_asian_pricer/`. Below is what each does and the key implementation choices.
+
+### 1. Data ingestion (`data.py`)
+
+`build_vol_grid()` pulls SPY chains from Yahoo Finance, picks up to 12 evenly-spaced expiries within `[2 days, 7 years]`, and constructs the per-expiry IV grid by:
+
+- **OTM-only filter**: puts with $K \le F$ + calls with $K > F$, where $F = S e^{rT}$. ITM IVs are noisy (small extrinsic value).
+- **Liquidity filter**: drop strikes with `openInterest <= 10`.
+- **Moneyness band**: keep only $K \in [0.7\, S, 1.3\, S]$ to avoid deep-tail garbage.
+- **Per-slice minimum**: discard any expiry with fewer than 5 surviving strikes.
+
+Output: a `dict` of DataFrames keyed by expiry string, each carrying `strike`, `impliedVolatility`, `dcf`, `fwd`, `logMoneyness`.
+
+### 2. SVI calibration (`svi.py`)
+
+For each slice we solve
+
+$$\min_{a, b, \rho, m, \sigma} \sum_i w_i \bigl[w_{\mathrm{SVI}}(y_i) - \sigma_{\mathrm{iv}, i}^2 T\bigr]^2$$
+
+via `scipy.optimize.least_squares` with the **TRF** (trust-region reflective) algorithm and parameter bounds $b \ge 0$, $|\rho| < 1$, $\sigma > 0$. Fit weights $w_i = e^{-y_i^2 / 2 \cdot 0.3^2}$ are vega-like — they emphasize ATM where the smile is best-quoted. Each slice fits in milliseconds.
+
+### 3. SVI → JWSVI conversion (`svi.py`)
+
+Closed-form transformation, no fitting. The 5 raw SVI parameters map to the 6 JWSVI parameters $(\nu, \phi, p, c, \tilde\nu, \mathrm{conv})$ via the formulas in Gatheral & Jacquier (2014). The inverse `JWSVIParam.to_svi()` round-trips with floating-point error.
+
+### 4. Time interpolation (`surface.py`)
+
+`JWSVIVolSurface` interpolates **WingDerived** mode (matches qlcore's `jwsvi_c_nt2`):
+
+- $(\nu T, \phi, p, c)$ are interpolated **linearly** when $\le 3$ tenors, **cubic** otherwise. Linear keeps $\nu T$ monotone non-decreasing, which is necessary for calendar-arbitrage-free reconstruction.
+- $\tilde\nu$ is **re-derived** from wing slopes at every target tenor: $\tilde\nu = 4 \nu p c / (p + c)^2$, then floored at $\min(\text{NUTILDA\_FLOOR}, 0.99 \nu)$.
+- `conv` is recomputed for diagnostics but does NOT enter the SVI reconstruction.
+
+### 5. Dupire local volatility (`dupire.py`)
+
+The numerator of Dupire's formula is $\partial_T w$. For each of 120 evenly-spaced strikes, we collect total variance at every benchmark tenor and fit a **natural cubic spline in $T$** with `scipy.interpolate.CubicSpline`. The derivative is then the spline's analytic derivative — no finite differences, no noise amplification.
+
+The denominator uses Gatheral's butterfly formula:
+
+$$\mathrm{denom}(K, T) = \Bigl(1 - \tfrac{y w'}{2 w}\Bigr)^2 - \tfrac{(w')^2}{4}\Bigl(\tfrac{1}{w} + \tfrac{1}{4}\Bigr) + \tfrac{w''}{2}$$
+
+with $w', w''$ from SVI's closed-form derivatives. To handle numerical edge cases at extreme strikes / short maturities, we apply **four safety clamps**:
+
+| Clamp | Constant | Purpose |
+|---|---|---|
+| `DWDT_FLOOR` | `1e-4` | Prevent negative/zero numerator from noisy spline |
+| `DENOM1_FLOOR` | `0.2` | Prevent denominator collapse near deep wings |
+| `DENS_RATIO_CAP` | `0.75` | Cap density-correction ratio |
+| `LV_OVER_ATM_CAP` | `10.0` | Cap local vol at $10 \times$ ATM IV |
+
+Hit rates for each clamp are recorded in `DupireLocalVol.clamp_stats` — if any one fires on $> 5\%$ of the grid, your input data is probably the problem.
+
+The final $(T, K)$ grid is wrapped in a `RectBivariateSpline` for fast vectorized lookup inside the MC loop.
+
+### 6. Monte Carlo pricing (`mc.py`)
+
+**Path simulation.** Euler-Maruyama on log-price:
+
+$$S_{t + \Delta t} = S_t \exp\!\Bigl(\bigl(r - \tfrac{1}{2}\sigma_{\mathrm{loc}}^2(S_t, t)\bigr) \Delta t + \sigma_{\mathrm{loc}}(S_t, t)\sqrt{\Delta t}\, Z\Bigr)$$
+
+We sample $\sigma_{\mathrm{loc}}$ at the **midpoint** $t + \Delta t/2$ for $O(\Delta t^2)$ weak-error improvement. The averaging grid (`n_obs` dates) and simulation grid (`n_steps_per_obs` Euler sub-steps) are **decoupled** so coarse averaging (e.g. monthly) keeps a fine Euler step.
+
+**Antithetic variates.** For each Brownian draw $Z$ we also use $-Z$, doubling sample size at no extra cost and cancelling first-order symmetric noise.
+
+**Geometric Asian control variate.** The Kemna–Vorst (1990) closed form gives an exact GBM price for the geometric Asian. We regress the discounted arithmetic payoff on the discounted geometric payoff to estimate the optimal $\beta$, then form
+
+$$\widehat{C}_{\mathrm{arith}}^{\mathrm{CV}} = \widehat{C}_{\mathrm{arith}}^{\mathrm{MC}} - \hat\beta\,\Bigl(\widehat{C}_{\mathrm{geom}}^{\mathrm{MC}} - C_{\mathrm{geom}}^{\mathrm{exact}}\Bigr)$$
+
+In practice $\hat\beta \approx 1$ and SE shrinks by 5-20× for SPY-like ATM smiles.
+
+**Greeks.** `compute_greeks()` runs central finite differences with **common random numbers** (`np.random.seed(42)` reset before each bump), so simulation noise cancels between $S \pm \delta S$ pairs. Vega bumps the local vol surface and the CV closed-form vol consistently to keep the control variate tied to the diffusion.
+
+---
+
+## What can it price?
+
+**Products supported**
+
+| Capability | Yes | No |
+|---|---|---|
+| Arithmetic-average Asian, **call** | ✅ `call=True` | |
+| Arithmetic-average Asian, **put** | ✅ `call=False` | |
+| Discrete monitoring (any frequency) | ✅ via `n_obs` | |
+| European vanilla | ✅ as a 1-obs Asian | |
+| Continuous-monitoring Asian | ⚠️ approximate via large `n_obs` | exact CV not implemented |
+| American / Bermudan Asian | | ❌ no early exercise |
+| Basket / rainbow / spread Asian | | ❌ single-asset only |
+
+**Strike range**
+
+The Dupire surface is built on $K \in [0.7\, S_0, 1.3\, S_0]$. Pricing at strikes in this band is reliable; outside, the local-vol grid extrapolates and accuracy degrades. Recommended: $|K/S_0 - 1| \le 0.25$.
+
+**Maturity range**
+
+Lower bound: half the shortest available expiry on Yahoo Finance (typically a few days for SPY).  Upper bound: longest available expiry (~2-3 years for SPY LEAPS).  Pricing past the longest tenor is extrapolation and not advised.
+
+**Underlying**
+
+The `data.py` helpers default to `"SPY"` but accept any ticker with a Yahoo Finance option chain (`SPY`, `QQQ`, `AAPL`, etc.). Behavior on tickers with sparse smiles (small caps, illiquid sectors) has not been validated.
+
+**Sensitivity outputs**
+
+| Greek | Method |
+|---|---|
+| Delta | Central FD, $\pm 1\%$ spot bump |
+| Gamma | Central FD, second-order $\pm 1\%$ spot bump |
+| Vega  | Central FD, $\pm 1$ vol point (absolute, e.g. 20% → 21%) |
+| Theta | One-sided, $-1$ calendar day |
+
+All under common random numbers.
+
+---
+
+## Limitations & assumptions
+
+We are explicit about what this package does NOT model so you can decide whether it fits your use case.
+
+### Model assumptions
+
+- **Pure local volatility.** The diffusion is $dS = rS\,dt + \sigma_{\mathrm{loc}}(S, t) S\, dW$. There is no stochastic vol component (no Heston, SABR, rough vol), no vol-of-vol, no jumps, no leverage effect beyond what's baked into the surface. For long-dated forward-skew-sensitive payoffs this matters — local vol is well-known to under-price forward-start volatility.
+- **Constant risk-free rate.** Default $r = 4.3\%$, no term structure, no stochastic rates. Fine for short-to-medium SPY tenors; questionable for multi-year LEAPS.
+- **No dividends.** Forward is computed as $F = S e^{rT}$. SPY pays ~1.3% dividend yield, so this systematically understates the put-call parity forward by ~1-2% at 1Y. Not currently exposed as a parameter.
+- **Mid-vol calibration.** We use Yahoo Finance's `impliedVolatility` field, which is a mid quote — no bid-ask spread modeling, no order book.
+
+### Numerical caveats
+
+- **Dupire safety clamps mask data quality.** The four clamps (see `DupireLocalVol.clamp_stats`) prevent crashes when the input surface has noisy second derivatives, but they also hide problems. If `denom1_floor_pct > 5%` or `lv_cap_pct > 5%`, the local vol surface is not trustworthy in those regions — investigate the input IVs.
+- **Control variate is not strictly unbiased.** The CV target is the GBM closed-form geometric Asian price using a flat ATM vol; under local-vol dynamics the geometric MC has its own bias relative to that target. The `cv_bias_proxy = geom_mc - geom_exact` field lets you size this — it's typically a few cents for ATM 6M SPY, but can grow with skew.
+- **Discretization.** Euler-Maruyama is weak order 1; for very long maturities or high-vol regimes consider increasing `n_steps_per_obs`. Default `n_steps_per_obs=1` is appropriate for daily-or-finer averaging.
+- **Throughput.** 200k paths × 126 obs × 1 sub-step takes ~5-10 seconds on a modern laptop. PDE methods would be faster for vanilla payoffs but lose generality for path-dependence.
+
+### Data caveats
+
+- **Yahoo Finance reliability.** Free data — stale quotes off-hours, missing volumes on illiquid strikes, occasional NaN IVs. The package filters but does not repair bad quotes.
+- **No SSVI smoothing.** We fit raw SVI per slice independently; we do not enforce calendar-arbitrage-free interpolation in calibration (only check it after the fact). For most SPY surfaces this is fine; for very steep skew or short tenors butterfly violations can occur — `check_butterfly_arbitrage()` will tell you.
+- **Single-snapshot.** Each call to `build_vol_grid()` is one point in time. No historical surface storage.
+
+### Scope
+
+- **European-style only.** No early exercise.
+- **Single-asset.** No basket, spread, rainbow, or quanto Asians.
+- **Vanilla averaging.** Equal-weighted arithmetic mean over uniformly-spaced dates. No weighted averaging, no float-strike, no in-progress (already-observed) paths.
 
 ---
 
