@@ -83,7 +83,7 @@ Under local vol, the spot path has no closed-form distribution, so we discretize
 - **Antithetic variates** — for each Brownian draw $Z$ we also use $-Z$, halving the noise from symmetric paths essentially for free.
 - **Geometric Asian control variate** — the *geometric* average $\bigl(\prod S_{t_i}\bigr)^{1/N}$ has a Black-Scholes-style closed-form price under GBM (Kemna & Vorst, 1990). Its MC realization is highly correlated (typically $\rho > 0.99$) with the arithmetic average. We subtract the regression-adjusted geometric MC error from the arithmetic estimate, often shrinking standard error by **5-20×** at the same path count.
 
-The CV target uses a flat ATM vol, so it is not strictly unbiased under local vol; the package reports the bias proxy $\mathbb{E}[\bar{A}_{\mathrm{geom}}^{\mathrm{MC}}] - C_{\mathrm{geom}}^{\mathrm{exact}}$ alongside the price so you can size the residual error.
+The CV target uses a flat ATM vol, so it is not strictly unbiased under local vol; the package reports the bias proxy $$\mathbb{E}[\bar{A}_{\mathrm{geom}}^{\mathrm{MC}}] - C_{\mathrm{geom}}^{\mathrm{exact}}$$ alongside the price so you can size the residual error.
 
 ---
 
