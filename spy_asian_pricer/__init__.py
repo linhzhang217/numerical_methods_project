@@ -34,4 +34,4 @@ __all__ = [
     "check_spread_arbitrage",
 ]
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
