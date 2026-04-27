@@ -66,7 +66,7 @@ Raw SVI parameters $(a, b, \rho, m, \sigma)$ have no direct financial interpreta
 | $\tilde\nu$ | minimum total variance (smile floor) |
 | $\mathrm{conv}$ | convexity |
 
-Because each parameter is a *financial* quantity, smooth time interpolation in JWSVI space produces a sensible, calendar-arbitrage-free surface even with sparse expiry coverage. We use the **WingDerived** mode: $(\nu T, \phi, p, c)$ are interpolated linearly (cubic if $>3$ slices), and $\tilde\nu$ is re-derived from the wing slopes via $\tilde\nu = 4\nu p c / (p+c)^2$, then clipped to $[\text{NUTILDA\_FLOOR},\, 0.99\,\nu]$ so the SVI radius stays well-defined and $\nu - \tilde\nu \ge 0$ always.
+Because each parameter is a *financial* quantity, smooth time interpolation in JWSVI space produces a sensible, calendar-arbitrage-free surface even with sparse expiry coverage. We use the **WingDerived** mode: $(\nu T, \phi, p, c)$ are interpolated linearly (cubic if $>3$ slices), and $\tilde\nu$ is re-derived from the wing slopes via $\tilde\nu = 4\nu p c / (p+c)^2$, then clipped to $\left[\text{NUTILDA\_FLOOR},\, 0.99,\, \nu\right]$ so the SVI radius stays well-defined and $\nu - \tilde\nu \ge 0$ always.
 
 ### Why three arbitrage checks?
 
@@ -120,7 +120,7 @@ Closed-form transformation, no fitting. The 5 raw SVI parameters map to the 6 JW
 `JWSVIVolSurface` interpolates **WingDerived** mode (matches qlcore's `jwsvi_c_nt2`):
 
 - $(\nu T, \phi, p, c)$ are interpolated **linearly** when $\le 3$ tenors, **cubic** otherwise. Linear keeps $\nu T$ monotone non-decreasing, which is necessary for calendar-arbitrage-free reconstruction.
-- $\tilde\nu$ is **re-derived** from wing slopes at every target tenor: $\tilde\nu = 4 \nu p c / (p + c)^2$, then **clipped to $[\text{NUTILDA\_FLOOR},\, 0.99\,\nu]$** so the SVI radius reconstruction in `to_svi` always sees $\nu - \tilde\nu > 0$.
+- $\tilde\nu$ is **re-derived** from wing slopes at every target tenor: $\tilde\nu = 4 \nu p c / (p + c)^2$, then clipped to $\left[\text{NUTILDA\_FLOOR},\, 0.99,\, \nu\right]$ so the SVI radius reconstruction in `to_svi` always sees $\nu - \tilde\nu > 0$.
 - `conv` is recomputed for diagnostics but does NOT enter the SVI reconstruction.
 - The forward used by `implied_vol` / `total_variance` is $F = S\, e^{(r-q) T}$ (the dividend yield is stored on the surface).
 - This re-derivation makes the surface **lossy at calibrated knots**: feeding `svi_orig.to_jwsvi(t)` into the surface and reading it back via `get_svi_at(t)` does NOT round-trip exactly. The notebook ships a "surface stability check" cell that quantifies this gap on a sensible moneyness band ($|y|\le 0.1$) split by tenor bucket.
