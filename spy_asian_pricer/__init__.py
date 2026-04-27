@@ -48,4 +48,4 @@ __all__ = [
 if _DATA_OK:
     __all__ += ["build_vol_grid", "fetch_dividend_yield", "fetch_spot", "select_expiries"]
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
