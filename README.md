@@ -196,7 +196,19 @@ with $n$ split half/half across $Z$ and $-Z$. Standard error is $O(1/\sqrt{n})$;
 
 ## What can it price?
 
-**Products supported**
+### Why SPY (and not single stocks)?
+
+This package is built and tested on SPY because it's uniquely suited to a **fully-automated pipeline running off Yahoo Finance** — i.e. retail-quality data with no trader curation:
+
+- **Liquidity**: the most-traded equity options market in the world (~3M contracts/day), with tight bid-ask, hundreds of strikes per expiry, and minute-fresh `lastPrice` even on a free feed.
+- **Smooth smile**: a basket of 500 stocks averages away idiosyncratic noise, so the empirical IV surface is statistically smooth — the regime where SVI's parametric form is a good fit.
+- **No event risk**: no earnings, no M&A, no dividend surprises beyond a small continuous yield.  Each expiry's smile is pure index vol, not company-specific shocks.
+
+Run the same pipeline on a single name like **AAPL or TSLA** and the diagnostics fall apart — typically: catastrophic per-slice SVI fits ($g_{\min} \ll -10$), 40–70% butterfly arb failure rate, $20$+ vol-point IV errors on wings, and a Dupire surface where >50% of grid points hit the safety clamps.  Single stocks need **Bloomberg-quality bid/ask + manual trader mark-overrides** to feed a stable surface — neither of which a free-data demo package can provide.  Liquid index ETFs (QQQ, IWM, EFA) sit somewhere in between SPY and single stocks and may work with parameter tightening.
+
+In short: **SPY is the "easy mode" where the methodology is what's being tested, not the data quality**.
+
+### Products supported
 
 | Capability | Yes | No |
 |---|---|---|
@@ -208,17 +220,17 @@ with $n$ split half/half across $Z$ and $-Z$. Standard error is $O(1/\sqrt{n})$;
 | American / Bermudan Asian | | ❌ no early exercise |
 | Basket / rainbow / spread Asian | | ❌ single-asset only |
 
-**Strike range**
+### Strike range
 
 The Dupire surface is built on $K \in [0.5\, S_0,\, 1.5\, S_0]$ (160 grid points). Pricing at strikes in this band is reliable; outside, the local-vol grid extrapolates and accuracy degrades. Recommended: $|K/S_0 - 1| \le 0.4$. Calling `local_vol(S, dcf)` outside the grid emits a `RuntimeWarning`; the MC inner loop (`local_vol_vec`) silently clips to the boundary instead of warning per Euler step.
 
-**Maturity range**
+### Maturity range
 
-Lower bound: half the shortest available expiry on Yahoo Finance (typically a few days for SPY).  Upper bound: longest available expiry (~2-3 years for SPY LEAPS).  Pricing past the longest tenor is extrapolation and not advised.
+Lower bound: shortest calibrated tenor (default `min_dte=2`, often `min_dte=14` in practice on Yahoo).  Upper bound: longest available expiry (default `max_dte=365*7`, ~2–3 years effective on SPY chains).  Pricing past the longest tenor is extrapolation and not advised.
 
-**Underlying**
+### Underlying
 
-The `data.py` helpers default to `"SPY"` but accept any ticker with a Yahoo Finance option chain (`SPY`, `QQQ`, `AAPL`, etc.). Behavior on tickers with sparse smiles (small caps, illiquid sectors) has not been validated.
+`SPY` is the **tested and recommended** ticker.  Other liquid index ETFs (`QQQ`, `IWM`, `EFA`) work with the same defaults but should be sanity-checked via `clamp_stats` and `check_*_arbitrage`.  Single stocks (`AAPL`, `TSLA`, `NVDA`, etc.) are accepted by `data.py` but **will routinely fail butterfly / calendar arb** under the default thresholds — see "Why SPY" above.  If you need single stocks, expect to (a) tighten `min_dte` to drop earnings-distorted weeklies, (b) tighten `filter_butterfly_arbitrage` threshold to `-0.01`, (c) prefer SSVI over JWSVI for its joint denoising, and (d) accept that some expiries will be unfittable without a manual mark.
 
 **Sensitivity outputs**
 
