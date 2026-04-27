@@ -64,4 +64,4 @@ if _DATA_OK:
         "select_expiries",
     ]
 
-__version__ = "0.1.7"
+__version__ = "0.1.6"
