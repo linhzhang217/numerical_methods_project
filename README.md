@@ -53,6 +53,30 @@ $$w(y) = a + b\,\Bigl(\rho\,(y - m) + \sqrt{(y - m)^2 + \sigma^2}\Bigr)$$
 
 The five parameters $(a, b, \rho, m, \sigma)$ control the level, slope, asymmetry, location and convexity of the smile. SVI fits real equity-index smiles to within a few basis points and admits closed-form first and second derivatives — exactly what Dupire needs.
 
+### When to prefer SSVI over per-slice JWSVI
+
+[Gatheral (2014)] also introduced **SSVI**, a *surface*-level joint parameterisation:
+
+$$w(k, t) = \tfrac{\theta(t)}{2}\,\Bigl(1 + \rho\,\phi(\theta) k + \sqrt{(\phi(\theta) k + \rho)^2 + 1 - \rho^2}\Bigr),\quad \phi(\theta) = \eta\,\theta^{-\gamma}$$
+
+Three global parameters $(\eta, \rho, \gamma)$ + a discrete ATM term structure $\theta(t)$.  The surface is **calendar-arbitrage-free by construction** when $\theta$ is monotone non-decreasing and $\gamma\in[0, 1/2]$.
+
+This package ships SSVI as a peer to JWSVI (`spy_asian_pricer.SSVISurface` + `calibrate_ssvi`).  Two modes:
+
+- **`mode='pinned'`** (3 free params): $\theta(t_i)$ = market ATM total variance from each calibrated slice; only $(\eta, \rho, \gamma)$ optimised.  Fast, matches per-slice ATM exactly, but inherits ATM-IV noise.
+- **`mode='full'`** (3 + N free params): $\theta_i$ also optimised under the constraint $\theta_{i+1} \ge \theta_i$ (cumsum-of-squares parameterisation).  Smooths the term structure, slower, but full denoise.
+
+When to pick which:
+
+| Situation | Pick |
+|---|---|
+| Clean Bloomberg / vendor data, pricing per-tenor European vanillas | per-slice JWSVI (production default; preserves per-tenor flexibility, vega-bucket-friendly) |
+| Noisy Yahoo data, want surface clean by construction | SSVI `full` |
+| Want to reproduce a JWSVI surface as a baseline before SSVI | SSVI `pinned` (matches per-slice ATM) |
+| Path-dependent products (Asian, barrier) on noisy data | SSVI `full` (calendar-arb-free → cleaner Dupire) |
+
+At each fixed tenor SSVI reduces in closed form to a raw SVI slice, so an `SSVISurface` plugs into `DupireLocalVol` exactly like a `JWSVIVolSurface`.
+
 ### Why JWSVI for time interpolation?
 
 Raw SVI parameters $(a, b, \rho, m, \sigma)$ have no direct financial interpretation, so interpolating them across maturities is unstable. **Gatheral & Jacquier (2014)** introduced the **Jump-Wing** reparameterization (JWSVI), a mathematically equivalent 6-tuple $(\nu, \phi, p, c, \tilde\nu, \mathrm{conv})$ with clear meaning:
@@ -90,12 +114,18 @@ Each pipeline stage maps 1-to-1 onto a module in `spy_asian_pricer/`. Below is w
 
 ### 1. Data ingestion (`data.py`)
 
-`build_vol_grid()` pulls SPY chains from Yahoo Finance, picks up to 12 evenly-spaced expiries within `[2 days, 7 years]`, and constructs the per-expiry IV grid by:
+`build_vol_grid()` pulls SPY chains from Yahoo Finance, selects expiries within `[min_dte, max_dte]` calendar days (default `[2, 365*7]` — standard "7-year cutoff" convention used in production; the library does NOT decide for you which Yahoo tenors are too noisy, see "Production-style cleanup" below), and constructs the per-expiry IV grid by:
 
 - **Forward with dividends**: $F = S\, e^{(r-q) T}$. The continuous-equivalent dividend yield $q$ is pulled from `Ticker.info` via `fetch_dividend_yield()` (yfinance returns it as either a fraction or a percent depending on version; the helper normalizes). Default fallback is 1.3% (SPY).
 - **OTM-only filter**: puts with $K \le F$ + calls with $K > F$. ITM IVs are noisy (small extrinsic value).
-- **Re-imply IV from `lastPrice`**: Yahoo's own `impliedVolatility` column is **discarded** and replaced via `implied_vol_from_price()` using the same $r, q$ that the rest of the pipeline uses. Yahoo's IV is computed by their own solver against an unspecified $r$ and $q$, and outside US trading hours it returns ~$10^{-5}$ for almost every strike (solver fails on stale `lastPrice`). Re-implying locally fixes both the inconsistency and the weekend/pre-market breakage; the resulting IV is only as fresh as the most recent trade for that strike.
-- **Liquidity filter**: keep only strikes with `volume > 0` (default `min_volume=0`).  Yahoo's `volume` persists the previous trading session over weekends, so this filter is well-defined any time of week and limits staleness to ≤1 trading day.  Open interest is NOT used because Yahoo's OI snapshot is broken outside market hours (returns sub-30 even for liquid SPY strikes whose true OI is in the thousands).
+- **Re-imply IV from bid/ask mid** (with `lastPrice` fallback): Yahoo's own `impliedVolatility` column is **discarded** and replaced via `implied_vol_from_price()` using the same $r, q$ that the rest of the pipeline uses. Mid quotes are fresher than last trades — for an illiquid strike the last print can be days old while the bid/ask snapshot is at most a 15-min delayed NBBO. Where bid or ask are absent (weekends / pre-market) the helper falls back to `lastPrice`.
+- **Two-tier quote-quality filter** (default; `use_mid=True`).  Yahoo's bid/ask snapshot disappears outside US market hours, so we use a soft fallback:
+
+  - **Tier A** (preferred — market hours): `bid > 0` AND `ask > bid` AND `(ask - bid)/mid < max_rel_spread` (default 50%).  Wing strikes with stale wide quotes get dropped.
+  - **Tier B** (fallback — weekend / pre-market when bid/ask are 0/NaN): accept the strike if `lastPrice > 0`.  We already used `lastPrice` to reverse-imply the IV via the mid-fallback path, so any strike that survived IV-reversal has a usable price.
+  - **Liquidity sanity** (independent of which tier): `volume > 0` OR `openInterest > 0` (some sign of life on this strike).
+
+  Net behaviour: market hours runs the strict spread filter that drops stale wing data; weekends fall back to a lastPrice-only path that matches the old behaviour.  Pass `use_mid=False` to disable both tiers and force the legacy `lastPrice`-only flow with a flat `volume > min_volume` filter; not recommended.
 - **Moneyness band**: keep only $K \in [0.7\, S, 1.3\, S]$ to avoid deep-tail garbage.
 - **Per-slice minimum**: discard any expiry with fewer than 5 surviving strikes.
 
@@ -224,7 +254,28 @@ We are explicit about what this package does NOT model so you can decide whether
 ### Data caveats
 
 - **Yahoo Finance reliability.** Free data — stale quotes off-hours, missing volumes on illiquid strikes, occasional NaN IVs. The package filters but does not repair bad quotes.
-- **Why arbitrage violations appear on raw market data.** Yahoo Finance provides raw mid-quote IVs without the cleaning, smoothing, or manual marking that occurs on a trading desk. Real vol surfaces in production are the result of (1) multi-source quote validation, (2) bid-ask spread + volume filtering, (3) parametric smoothing (SVI/SSVI), and (4) trader manual override of anomalous quotes — especially on short-dated and far-OTM strikes. Without these layers, raw Yahoo IVs will produce butterfly/calendar arbitrage violations on noisy slices. This is a feature, not a bug: our `check_*_arbitrage()` diagnostics surface exactly where the data fails, allowing the user to filter (e.g. `min_dte=30`) or apply additional smoothing as needed.
+- **Why arbitrage violations appear on raw market data.** Yahoo Finance provides raw mid-quote IVs without the cleaning, smoothing, or manual marking that occurs on a trading desk. Real vol surfaces in production are the result of (1) multi-source quote validation, (2) bid-ask spread + volume filtering, (3) parametric smoothing (SVI/SSVI), and (4) trader manual override of anomalous quotes — especially on short-dated and far-OTM strikes. Without these layers, raw Yahoo IVs will produce butterfly/calendar arbitrage violations on noisy slices. This is a feature, not a bug: our `check_*_arbitrage()` diagnostics surface exactly where the data fails, allowing the user to filter (e.g. `min_dte=14`) or apply additional smoothing as needed.
+
+#### Production-style cleanup
+
+In a sell-side bank or HF the workflow after each per-slice SVI fit is:
+
+1. The trader (or a junior quant on the surface team) eyeballs every smile.
+2. Any slice whose density discriminant $g(y)$ is catastrophically negative gets pulled out of the calibration set — either re-fit with tighter bounds / different weights, or marked by hand from a parallel bid/ask source.
+3. Only the cleaned set goes into the time-interpolated surface (here JWSVI).
+
+This package automates step 2 with `filter_butterfly_arbitrage(svi_slices, threshold=-0.05)`:
+
+```python
+from spy_asian_pricer import calibrate_svi, filter_butterfly_arbitrage, JWSVIVolSurface
+
+svi_slices = {exp: (calibrate_svi(...), dcf) for ...}
+svi_clean, dropped = filter_butterfly_arbitrage(svi_slices, threshold=-0.05)
+jwsvi_slices = {k: (svi.to_jwsvi(dcf), dcf) for k, (svi, dcf) in svi_clean.items()}
+surface = JWSVIVolSurface(jwsvi_slices, spot=spot, r=r, q=q)
+```
+
+Default threshold `-0.05` is conservative (only catastrophic fits). Tighten to `-0.01` for a stricter cut; loosen to `-0.5` to only catch the absolute worst. The JWSVI time interpolator bridges the dropped tenors smoothly using the surviving neighbouring knots.
 - **No SSVI smoothing.** We fit raw SVI per slice independently; we do not enforce calendar-arbitrage-free interpolation in calibration (only check it after the fact). For most SPY surfaces this is fine; for very steep skew or short tenors butterfly violations can occur — `check_butterfly_arbitrage()` will tell you.
 - **Single-snapshot.** Each call to `build_vol_grid()` is one point in time. No historical surface storage.
 
@@ -329,8 +380,8 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 | `fetch_spot(ticker="SPY") -> float` | Most recent close from yfinance. |
 | `fetch_risk_free_rate(tenor_years=0.25, default=0.043) -> float` | Risk-free rate from Yahoo Treasury yields (`^IRX` 13W → `^FVX` 5Y → `^TNX` 10Y → `^TYX` 30Y), linearly interpolated by tenor. Yahoo quotes percent; helper divides by 100. Falls back to `default` on missing fields or network errors. |
 | `fetch_dividend_yield(ticker="SPY", default=0.013) -> float` | Continuous-equivalent dividend yield from `Ticker.info`. Auto-normalizes the yfinance "fraction vs percent" inconsistency. Falls back to `default` on missing fields or network errors. |
-| `build_vol_grid(ticker="SPY", spot=None, r=0.043, q=None, ...)` | Pulls option chains and builds the per-expiry IV grid.  IV column is re-implied from `lastPrice` via `implied_vol_from_price` (Yahoo's own IV is discarded). When `q` is None it is fetched via `fetch_dividend_yield`. Returns `{expiry_str: DataFrame}`. |
-| `select_expiries(ticker="SPY", max_expiries=None, ...)` | Helper to pick expiries within a DTE band (default `[2 days, 7 years]`).  `max_expiries=None` returns every expiry in the band (matches eqdquant's `vol_surface_date_filter` "use everything inside cutoff" convention); pass an integer to evenly sub-sample. |
+| `build_vol_grid(ticker="SPY", spot=None, r=0.043, q=None, min_dte=2, max_dte=365*7, ...)` | Pulls option chains and builds the per-expiry IV grid.  IV column is re-implied from bid/ask mid (or `lastPrice` fallback) via `implied_vol_from_price` (Yahoo's own IV is discarded).  Tenor band defaults to `[2, 365*7]` days (standard 7y cutoff).  On noisy Yahoo data tighten via `min_dte=14, max_dte=365*5` and/or post-process with `filter_butterfly_arbitrage`.  When `q` is None it is fetched via `fetch_dividend_yield`. Returns `{expiry_str: DataFrame}`. |
+| `select_expiries(ticker="SPY", max_expiries=None, min_dte=2, max_dte=365*7)` | Helper to pick expiries within a DTE band.  Defaults follow the industry-standard "7-year cutoff" convention; the library does NOT decide for you which Yahoo tenors are too noisy.  Tighten with `min_dte=14, max_dte=365*5` for cleaner Yahoo input.  `max_expiries=None` returns every expiry in the band; pass an integer to evenly sub-sample. |
 | `bs_european_price(S, K, r, q, sigma, T, call=True) -> float` | Black-Scholes European option price with continuous dividend yield. |
 | `implied_vol_from_price(price, S, K, r, q, T, call=True) -> float` | Reverse-imply BS volatility from an observed option price (Brent on `[1e-4, 5.0]`).  Returns `NaN` if price is below forward intrinsic or solver brackets fail. |
 
@@ -346,7 +397,9 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 
 | Object | Description |
 |---|---|
-| `JWSVIVolSurface(jwsvi_slices, spot, r, q=0.0)` | Time interpolation of $(\nu T, \phi, p, c)$ with WingDerived $\tilde\nu$ re-derivation. `q` is the continuous dividend yield used in `forward(dcf) = spot * exp((r - q) * dcf)`. |
+| `JWSVIVolSurface(jwsvi_slices, spot, r, q=0.0)` | Per-slice JWSVI + WingDerived $\tilde\nu$ time interpolation. `q` is continuous dividend yield used in `forward(dcf) = spot * exp((r - q) * dcf)`. |
+| `SSVISurface(dcfs, thetas, eta, rho, gamma, spot, r, q=0.0)` | Gatheral SSVI surface (joint $(\eta, \rho, \gamma)$ + monotone $\theta(t)$).  Calendar-arb-free by construction.  Same consumer API as `JWSVIVolSurface`; plugs into `DupireLocalVol` via duck-typed `get_svi_at(dcf)`. |
+| `calibrate_ssvi(vol_data, spot, r, q=0.0, mode='pinned')` | Build an `SSVISurface` from `vol_data`.  `mode='pinned'`: 3-param fit, $\theta(t)$ = market ATM.  `mode='full'`: 3+N param fit with monotone $\theta(t)$ (cumsum-of-squares parameterisation). |
 | `.forward(dcf) -> float` | Forward price at tenor `dcf`. |
 | `.implied_vol(K, dcf)` | Implied vol at strike `K` and time `dcf`. |
 | `.total_variance(K, dcf)` | Total variance $w = \sigma_{\mathrm{iv}}^2 T$. |
@@ -377,6 +430,7 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 | `check_butterfly_arbitrage(svi, dcf)` | Per-slice PDF positivity (Gatheral $g(y) \ge 0$). Returns `(ok, n_violations, g_min)`. |
 | `check_calendar_arbitrage(vol_surface, K)` | Total variance non-decreasing in $T$ at every strike. Returns `(ok, n_violations, details)`. |
 | `check_spread_arbitrage(vol_surface, dcf, K, r, q=None)` | Call prices monotone in $K$ with slope $\ge -e^{-rT}$, forward $F = S\, e^{(r-q) T}$. `q` defaults to `vol_surface.q`. Returns `(ok, n_violations, details)`. |
+| `filter_butterfly_arbitrage(svi_slices, threshold=-0.05, ...)` | Trader-style cleanup: drop slices whose Gatheral $g_{\min}$ is below `threshold`. Returns `(kept_slices, dropped_info)`.  See "Production-style cleanup" below. |
 
 ---
 

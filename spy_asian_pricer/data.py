@@ -193,10 +193,28 @@ def select_expiries(
 ) -> List[str]:
     """Return all expiry strings in ``[min_dte, max_dte]`` calendar days.
 
-    By default (``max_expiries=None``) returns every expiry within the DTE
-    band, matching the eqdquant ``vol_surface_date_filter`` convention of
-    "use everything inside a 7-year cutoff".  Pass an integer to evenly
-    sub-sample down to that count.
+    Defaults follow the industry-standard "use every expiry within a 7-year
+    cutoff" convention.  This keeps the helper neutral: the library does NOT
+    decide for you which Yahoo tenors are "noisy" -- that judgment belongs
+    in the calling code.
+
+    For Yahoo-quality data on volatile short-dated wings you typically
+    want to **tighten** this band, e.g.::
+
+        select_expiries('SPY', min_dte=14, max_dte=365*5)   # drops weeklies + far LEAPS
+
+    or, for weekly products only::
+
+        select_expiries('SPY', min_dte=2,  max_dte=60)
+
+    See :func:`spy_asian_pricer.arbitrage.filter_butterfly_arbitrage` for
+    the complementary post-calibration filter that drops slices whose
+    SVI fit produced negative-density (catastrophic butterfly arb) -- in
+    production this kind of slice is removed manually by traders after
+    eyeballing the smile; the helper automates the threshold cut.
+
+    ``max_expiries=None`` returns every expiry in the band; pass an
+    integer to evenly sub-sample.
     """
     tkr = yf.Ticker(ticker)
     today = pd.Timestamp.today().normalize()
@@ -220,23 +238,45 @@ def build_vol_grid(
     moneyness_band: float = 0.3,
     min_volume: int = 0,
     min_strikes_per_slice: int = 5,
+    min_dte: int = 2,
+    max_dte: int = 365 * 7,
+    max_rel_spread: float = 0.5,
+    use_mid: bool = True,
 ) -> Dict[str, "pd.DataFrame"]:
     """Pull option chains and build the per-expiry IV smile grid.
 
     Forward uses ``spot * exp((r - q) * dcf)``.  When ``q`` is None the
     dividend yield is fetched from yfinance via :func:`fetch_dividend_yield`.
 
-    The ``impliedVolatility`` column is **re-implied locally** from
-    ``lastPrice`` via :func:`implied_vol_from_price` using the ``r``, ``q``
-    actually passed into this function.  Yahoo's own ``impliedVolatility``
-    field is ignored because it is unreliable outside US market hours.
+    The ``impliedVolatility`` column is **re-implied locally** from the
+    bid/ask **mid** (or ``lastPrice`` fallback when bid/ask are 0/NaN) via
+    :func:`implied_vol_from_price`, using the ``r``, ``q`` passed into this
+    function.  Yahoo's own ``impliedVolatility`` field is ignored because
+    it is unreliable outside US market hours.
 
-    Liquidity filter is ``volume > min_volume`` (default 0, i.e. "any
-    positive volume").  Yahoo's ``volume`` persists the previous trading
-    session's totals over weekends, so this filter is well-defined any
-    time of week.  Open interest is NOT used because Yahoo's OI snapshot
-    is broken outside market hours (returns sub-30 even for liquid SPY
-    strikes whose true OI is in the thousands).
+    Liquidity / quote-quality filter (when ``use_mid=True``):
+
+      - ``bid > 0``                       (someone willing to buy)
+      - ``ask > bid``                     (not a crossed quote)
+      - ``(ask - bid) / mid < max_rel_spread``   (default 50%; tighter cuts more wing)
+      - ``volume > min_volume`` OR ``openInterest > 0``  (some sign of life)
+
+    With ``use_mid=False`` we fall back to the older ``lastPrice``-only
+    pipeline with a flat ``volume > min_volume`` filter (kept for
+    reproducibility; not recommended).
+
+    Tenor band ``[min_dte, max_dte]`` is forwarded to
+    :func:`select_expiries` when ``expiries`` is None.  Defaults
+    ``[2, 365*7]`` match the standard 7-year window used in production.  On Yahoo data
+    you typically want to TIGHTEN this -- weekly Yahoo IVs are noisy
+    and produce calendar/butterfly arbitrage in the calibrated surface.
+    A reasonable "clean Yahoo" preset:
+    ``build_vol_grid(..., min_dte=14, max_dte=365*5)``.
+
+    See :func:`spy_asian_pricer.arbitrage.filter_butterfly_arbitrage`
+    for the complementary post-calibration filter that automates what
+    a trader does manually in production -- drop SVI slices whose fit
+    produced a catastrophically negative density.
 
     Returns ``{expiry_str: DataFrame}`` with columns:
         strike, impliedVolatility, lastPrice, volume, openInterest, optType,
@@ -249,14 +289,22 @@ def build_vol_grid(
     if q is None:
         q = fetch_dividend_yield(ticker)
     if expiries is None:
-        expiries = select_expiries(ticker)
+        expiries = select_expiries(ticker, min_dte=min_dte, max_dte=max_dte)
 
     vol_data: Dict[str, pd.DataFrame] = {}
     for exp_str in expiries:
         chain = tkr.option_chain(exp_str)
-        cols = ["strike", "impliedVolatility", "lastPrice", "volume", "openInterest"]
-        calls = chain.calls[cols].copy()
-        puts = chain.puts[cols].copy()
+        cols = [
+            "strike", "impliedVolatility", "lastPrice", "bid", "ask",
+            "volume", "openInterest",
+        ]
+        # yfinance sometimes omits bid/ask on illiquid tickers; tolerate.
+        avail = [c for c in cols if c in chain.calls.columns]
+        calls = chain.calls[avail].copy()
+        puts = chain.puts[avail].copy()
+        for c in ("bid", "ask"):
+            if c not in calls.columns:
+                calls[c] = 0.0; puts[c] = 0.0
         calls["optType"] = "C"
         puts["optType"] = "P"
 
@@ -268,29 +316,67 @@ def build_vol_grid(
         otm_puts = puts[puts["strike"] <= fwd].copy()
         otm_calls = calls[calls["strike"] > fwd].copy()
 
-        # Re-imply IV from lastPrice using OUR (r, q).  Yahoo's own
-        # impliedVolatility column is overwritten because it's unreliable
-        # outside US market hours (returns ~1e-5 when the solver fails).
+        # Compute mid (with lastPrice fallback when bid/ask missing) and
+        # relative spread for both legs.
+        for side_df in (otm_puts, otm_calls):
+            bid = side_df["bid"].fillna(0.0).clip(lower=0.0)
+            ask = side_df["ask"].fillna(0.0).clip(lower=0.0)
+            mid = (bid + ask) / 2.0
+            # Where bid/ask absent or crossed, fall back to lastPrice
+            valid_quote = (bid > 0) & (ask > bid)
+            side_df["mid"] = mid.where(valid_quote, side_df["lastPrice"])
+            side_df["rel_spread"] = np.where(
+                valid_quote & (mid > 0), (ask - bid) / mid, np.inf
+            )
+            side_df["price_for_iv"] = side_df["mid"] if use_mid else side_df["lastPrice"]
+
+        # Re-imply IV from chosen quote price.
         otm_puts["impliedVolatility"] = otm_puts.apply(
             lambda x: implied_vol_from_price(
-                x["lastPrice"], spot, x["strike"], r, q, dcf, call=False
+                x["price_for_iv"], spot, x["strike"], r, q, dcf, call=False
             ),
             axis=1,
         )
         otm_calls["impliedVolatility"] = otm_calls.apply(
             lambda x: implied_vol_from_price(
-                x["lastPrice"], spot, x["strike"], r, q, dcf, call=True
+                x["price_for_iv"], spot, x["strike"], r, q, dcf, call=True
             ),
             axis=1,
         )
         df = pd.concat([otm_puts, otm_calls], ignore_index=True)
         df = df.dropna(subset=["impliedVolatility"]).copy()  # drop solver failures
 
-        df = df[
-            (df["impliedVolatility"] > 0.01)
-            & (df["impliedVolatility"] < 2.0)
-            & (df["volume"].fillna(0) > min_volume)
-        ].copy()
+        # IV-range sanity (always)
+        mask = (df["impliedVolatility"] > 0.01) & (df["impliedVolatility"] < 2.0)
+
+        if use_mid:
+            # Two-tier quote-quality filter so the path is well-defined any
+            # time of week:
+            #
+            #   tier A (preferred, market hours): bid/ask are populated,
+            #     bid > 0 AND ask > bid AND (ask-bid)/mid < max_rel_spread.
+            #
+            #   tier B (fallback, weekends/pre-market when Yahoo bid/ask=0):
+            #     accept the strike if lastPrice > 0 -- we already used it
+            #     to reverse-imply IV via the mid-fallback path above.
+            has_valid_quote = (df["bid"].fillna(0) > 0) & (
+                df["ask"].fillna(0) > df["bid"].fillna(0)
+            )
+            tier_a = has_valid_quote & (
+                df["rel_spread"].fillna(np.inf) < max_rel_spread
+            )
+            tier_b = ~has_valid_quote & (df["lastPrice"].fillna(0) > 0)
+            mask &= tier_a | tier_b
+            # Liquidity sanity (independent of quote tier).
+            mask &= (
+                (df["volume"].fillna(0) > min_volume)
+                | (df["openInterest"].fillna(0) > 0)
+            )
+        else:
+            # Legacy lastPrice path: flat volume filter only.
+            mask &= (df["volume"].fillna(0) > min_volume)
+
+        df = df[mask].copy()
 
         lo = (1.0 - moneyness_band) * spot
         hi = (1.0 + moneyness_band) * spot

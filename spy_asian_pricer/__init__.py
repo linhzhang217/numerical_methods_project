@@ -14,9 +14,11 @@ from .arbitrage import (
     check_butterfly_arbitrage,
     check_calendar_arbitrage,
     check_spread_arbitrage,
+    filter_butterfly_arbitrage,
 )
 from .dupire import DupireLocalVol
 from .mc import AsianMCPricer, compute_greeks, geometric_asian_call_price
+from .ssvi import SSVISurface, calibrate_ssvi
 from .surface import JWSVIVolSurface
 from .svi import JWSVIParam, SVIParam, calibrate_svi
 
@@ -40,6 +42,8 @@ __all__ = [
     "JWSVIParam",
     "calibrate_svi",
     "JWSVIVolSurface",
+    "SSVISurface",
+    "calibrate_ssvi",
     "DupireLocalVol",
     "AsianMCPricer",
     "geometric_asian_call_price",
@@ -47,6 +51,7 @@ __all__ = [
     "check_butterfly_arbitrage",
     "check_calendar_arbitrage",
     "check_spread_arbitrage",
+    "filter_butterfly_arbitrage",
 ]
 if _DATA_OK:
     __all__ += [
@@ -59,4 +64,4 @@ if _DATA_OK:
         "select_expiries",
     ]
 
-__version__ = "0.1.5"
+__version__ = "0.1.7"

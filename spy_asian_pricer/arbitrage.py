@@ -5,11 +5,16 @@ Three independent checks:
     2. Calendar arbitrage   -> total variance non-decreasing in T per strike.
     3. Spread arbitrage     -> call prices monotone decreasing in K with
                               slope bounded below by -exp(-rT).
+
+Plus :func:`filter_butterfly_arbitrage`, a "trader-style" post-calibration
+helper that drops slices whose SVI fit produced a catastrophically
+negative density.  In production this kind of slice is excluded by hand
+after eyeballing the smile; the helper just automates a threshold cut.
 """
 
 from __future__ import annotations
 
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import numpy as np
 from scipy.stats import norm
@@ -130,3 +135,73 @@ def check_spread_arbitrage(
             )
 
     return violations == 0, violations, details
+
+
+def filter_butterfly_arbitrage(
+    svi_slices: Dict[str, Tuple[SVIParam, float]],
+    threshold: float = -0.05,
+    y_range: Tuple[float, float] = (-0.5, 0.5),
+    n: int = 200,
+    verbose: bool = True,
+) -> Tuple[Dict[str, Tuple[SVIParam, float]], List[dict]]:
+    """Drop SVI slices whose Gatheral density discriminant ``g(y)`` falls
+    below ``threshold`` (catastrophically negative density).
+
+    This is the "trader-style" cleanup that real desks do manually
+    after eyeballing each calibrated smile.  In production the trader
+    pulls the bad slice out of the calibration set, optionally re-fits
+    with tighter bounds or different weights, or marks the surface
+    around it by hand.  Here we just drop the offending slice; the
+    JWSVI time interpolator then bridges that tenor smoothly using the
+    surviving neighbouring knots.
+
+    Default ``threshold = -0.05`` is conservative -- only catches
+    catastrophic fits (g_min more negative than -0.05).  Tighten to
+    ``threshold = -0.01`` for a stricter cut, loosen to ``-0.5`` to
+    only catch the absolutely worst.
+
+    Parameters
+    ----------
+    svi_slices : dict
+        Mapping ``{label: (SVIParam, dcf)}`` -- the per-slice fits.
+    threshold : float, default -0.05
+        Slice is dropped iff ``g_min < threshold``.
+    y_range, n : passed through to :func:`check_butterfly_arbitrage`.
+    verbose : bool, default True
+        Print one line per dropped slice.
+
+    Returns
+    -------
+    kept : dict
+        Same shape as input, with offending slices removed.
+    dropped : list of dict
+        Per-dropped-slice info ``{label, dcf, g_min, n_violations}``.
+    """
+    kept: Dict[str, Tuple[SVIParam, float]] = {}
+    dropped: List[dict] = []
+    for label, (svi, dcf) in svi_slices.items():
+        ok, n_viol, g_min = check_butterfly_arbitrage(svi, dcf, y_range=y_range, n=n)
+        if g_min < threshold:
+            info = {
+                "label": label,
+                "dcf": float(dcf),
+                "g_min": float(g_min),
+                "n_violations": int(n_viol),
+            }
+            dropped.append(info)
+            if verbose:
+                print(
+                    f"  DROP {label} (dcf={dcf:.4f}): "
+                    f"g_min={g_min:.3e}, n_viol={n_viol}"
+                )
+        else:
+            kept[label] = (svi, dcf)
+
+    if verbose:
+        n_in = len(svi_slices)
+        n_out = len(kept)
+        print(
+            f"filter_butterfly_arbitrage(threshold={threshold}): "
+            f"kept {n_out}/{n_in} slices, dropped {len(dropped)}."
+        )
+    return kept, dropped

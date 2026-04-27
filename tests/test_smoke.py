@@ -20,10 +20,13 @@ from spy_asian_pricer import (
     AsianMCPricer,
     DupireLocalVol,
     JWSVIVolSurface,
+    SSVISurface,
     SVIParam,
+    calibrate_ssvi,
     calibrate_svi,
     geometric_asian_call_price,
 )
+from spy_asian_pricer.ssvi import _ssvi_w
 
 
 def _bs_call(S0: float, K: float, r: float, sigma: float, T: float) -> float:
@@ -173,3 +176,72 @@ def test_mc_one_obs_asian_put_matches_european():
     err = abs(res["price"] - bs_put)
     tol = 3.0 * res["std_err"] + 0.05
     assert err < tol, f"MC put ${res['price']:.4f} vs BS put ${bs_put:.4f} (err={err:.4f}, tol={tol:.4f})"
+
+
+# -------------------- SSVI --------------------
+
+def _make_ssvi_synthetic_grid(spot=714.0, r=0.036, q=0.011,
+                              eta=1.2, rho=-0.55, gamma=0.35):
+    """Generate a synthetic per-expiry IV grid sampled exactly from a known
+    SSVI surface, so we can recover (eta, rho, gamma) cleanly."""
+    import pandas as pd
+    vol_data = {}
+    for label, dcf in [("1M", 30 / 365.0), ("3M", 90 / 365.0),
+                       ("6M", 0.5), ("1Y", 1.0), ("2Y", 2.0)]:
+        fwd = spot * np.exp((r - q) * dcf)
+        strikes = spot * np.exp(np.linspace(-0.2, 0.2, 31))
+        k = np.log(strikes / fwd)
+        theta = 0.04 * dcf
+        w = _ssvi_w(k, np.full_like(k, theta), eta, rho, gamma)
+        iv = np.sqrt(w / dcf)
+        vol_data[label] = pd.DataFrame({
+            "strike": strikes, "impliedVolatility": iv,
+            "dcf": dcf, "fwd": fwd, "logMoneyness": k,
+        })
+    return vol_data, spot, r, q
+
+
+def test_ssvi_pinned_recovers_synthetic_truth():
+    """SSVI pinned-mode calibration should recover (eta, rho, gamma) on a
+    surface generated from known truth, since theta(t) is exact."""
+    vol_data, spot, r, q = _make_ssvi_synthetic_grid()
+    s = calibrate_ssvi(vol_data, spot=spot, r=r, q=q, mode="pinned",
+                       verbose=False)
+    assert abs(s.eta - 1.2) < 5e-2,   f"eta off: {s.eta}"
+    assert abs(s.rho + 0.55) < 5e-2,  f"rho off: {s.rho}"
+    assert abs(s.gamma - 0.35) < 5e-2, f"gamma off: {s.gamma}"
+
+
+def test_ssvi_full_recovers_synthetic_truth_and_theta():
+    """Full mode should recover both globals AND theta(t) on synthetic data."""
+    vol_data, spot, r, q = _make_ssvi_synthetic_grid()
+    s = calibrate_ssvi(vol_data, spot=spot, r=r, q=q, mode="full",
+                       verbose=False)
+    assert abs(s.eta - 1.2) < 5e-2
+    assert abs(s.rho + 0.55) < 5e-2
+    assert abs(s.gamma - 0.35) < 5e-2
+    # theta(t) = 0.04 * t should be recovered
+    expected_thetas = 0.04 * s.dcfs
+    assert np.max(np.abs(s.thetas - expected_thetas)) < 5e-3, (
+        s.thetas, expected_thetas
+    )
+
+
+def test_ssvi_plugs_into_dupire_and_pricer():
+    """SSVI surface should drop into DupireLocalVol and AsianMCPricer
+    via duck-typed get_svi_at()."""
+    vol_data, spot, r, q = _make_ssvi_synthetic_grid()
+    surf = calibrate_ssvi(vol_data, spot=spot, r=r, q=q, mode="pinned",
+                          verbose=False)
+    lv = DupireLocalVol(surf)
+    # Synthetic SSVI is calendar-arb-free by construction, so clamps
+    # should fire on essentially zero of the grid.
+    assert lv.clamp_stats["dwdt_floor_pct"] < 5.0
+    assert lv.clamp_stats["denom1_floor_pct"] < 5.0
+
+    p = AsianMCPricer(S0=spot, r=r, T=0.5, n_obs=26,
+                      vol_surface=surf, local_vol_surface=lv)
+    np.random.seed(99)
+    res = p.price_asian(K=spot, n_paths=20_000)
+    assert res["price"] > 0
+    assert res["std_err"] > 0
