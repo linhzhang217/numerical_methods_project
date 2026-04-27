@@ -239,11 +239,13 @@ We are explicit about what this package does NOT model so you can decide whether
 ## Installation
 
 ```bash
-pip install spy-asian-pricer            # core (numpy, scipy)
-pip install spy-asian-pricer[data]      # + yfinance, pandas (chain fetching)
-pip install spy-asian-pricer[plot]      # + matplotlib (notebook charts)
-pip install spy-asian-pricer[data,plot] # full — recommended for the demo notebook
+pip install spy-asian-pricer                   # core (numpy, scipy)
+pip install "spy-asian-pricer[data]"           # + yfinance, pandas (chain fetching)
+pip install "spy-asian-pricer[plot]"           # + matplotlib (notebook charts)
+pip install "spy-asian-pricer[data,plot]"     # full — recommended for the demo notebook
 ```
+
+> **Note on quoting**: the brackets in `[data,plot]` are glob characters in zsh (macOS default since 10.15) and will produce `no matches found` if unquoted.  Quoting works in both `bash` and `zsh`, so always wrap the package spec in double quotes when using extras.
 
 ---
 
