@@ -8,7 +8,7 @@ Arithmetic-average Asian option pricing on SPY under **Dupire local volatility**
 
 ## What problem does this solve?
 
-Pricing path-dependent payoffs on a real index requires more than Black-Scholes — you need a vol surface that's smooth in both strike and time, free of static arbitrage, and consistent with every market-quoted vanilla option. This package handles the full pipeline end-to-end: pull SPY option chains from Yahoo Finance, fit an SVI smile per expiry, interpolate across maturities via JWSVI, derive the Dupire local volatility surface, and price arithmetic-average Asian options by Monte Carlo with antithetic variates and a geometric Asian control variate.
+Pricing path-dependent payoffs on a real index requires more than Black-Scholes — you need a vol surface that's smooth in both strike and time, free of static arbitrage, and consistent with every market-quoted vanilla option. This package handles the full pipeline end-to-end: pull SPY option chains from Yahoo Finance, fit an SVI smile per expiry, interpolate across maturities via JWSVI, derive the Dupire local volatility surface, and price arithmetic-average Asian options by Monte Carlo with antithetic variates.
 
 ```
 Yahoo Finance option chains
@@ -17,7 +17,7 @@ Yahoo Finance option chains
    -> JWSVI time interpolation (WingDerived nu_tilda)
    -> Arbitrage diagnostics (butterfly / calendar / spread)
    -> Dupire local vol  (cubic-spline dw/dT, Gatheral denominator)
-   -> Monte Carlo  (Euler-Maruyama + antithetic + geometric Asian CV)
+   -> Monte Carlo  (Euler-Maruyama + antithetic variates)
    -> Asian price, Greeks, convergence diagnostics
 ```
 
@@ -76,14 +76,11 @@ A vol surface that violates static arbitrage allows a model-free strategy with p
 2. **Calendar** — total variance $w(K, T)$ is non-decreasing in $T$ for every strike.
 3. **Spread** — call prices are monotone in $K$ with slope bounded below by $-e^{-rT}$ (no two-call portfolio dominates a third).
 
-### Why Monte Carlo with a control variate?
+### Why Monte Carlo with antithetic variates?
 
-Under local vol, the spot path has no closed-form distribution, so we discretize the SDE (Euler-Maruyama on log-price) and average the discounted payoff over many simulated paths. Plain MC has standard error $O(1/\sqrt{n})$, which is slow. We apply two variance-reduction tricks:
+Under local vol, the spot path has no closed-form distribution, so we discretize the SDE (Euler-Maruyama on log-price) and average the discounted payoff over many simulated paths. Plain MC has standard error $O(1/\sqrt{n})$. We use **antithetic variates** — for each Brownian draw $Z$ we also use $-Z$, halving the noise from symmetric paths essentially for free.
 
-- **Antithetic variates** — for each Brownian draw $Z$ we also use $-Z$, halving the noise from symmetric paths essentially for free.
-- **Geometric Asian control variate** — the *geometric* average $\bigl(\prod S_{t_i}\bigr)^{1/N}$ has a Black-Scholes-style closed-form price under GBM (Kemna & Vorst, 1990). Its MC realization is highly correlated (typically $\rho > 0.99$) with the arithmetic average. We subtract the regression-adjusted geometric MC error from the arithmetic estimate, often shrinking standard error by **5-20×** at the same path count.
-
-The CV target uses a flat ATM vol, so it is not strictly unbiased under local vol; the package reports the bias proxy $\bar{A}_{\mathrm{geom}}^{\mathrm{MC}} - C_{\mathrm{geom}}^{\mathrm{exact}}$ alongside the price so you can size the residual error.
+> **Why no control variate?** A natural CV is the geometric-Asian Kemna–Vorst (1990) closed form. It works perfectly under flat vol, but on a skewed local-vol surface the K-V target (which assumes GBM with a single flat ATM vol) systematically misses the true expectation of the geometric leg by several percent — a bias far larger than the MC error it removes. Recentering the target with an independent pilot MC introduces enough pilot variance to dominate the variance gain, making the recentered estimator worse than no-CV at the same compute budget. We therefore drop CV and rely on antithetic + path count. The closed form is still exposed as `geometric_asian_call_price` for flat-vol benchmarking.
 
 ---
 
@@ -156,13 +153,13 @@ We sample $\sigma_{\mathrm{loc}}$ at the **midpoint** $t + \Delta t/2$ for $O(\D
 
 **Antithetic variates.** For each Brownian draw $Z$ we also use $-Z$, doubling sample size at no extra cost and cancelling first-order symmetric noise.
 
-**Geometric Asian control variate.** The Kemna–Vorst (1990) closed form gives an exact GBM price for the geometric Asian. We regress the discounted arithmetic payoff on the discounted geometric payoff to estimate the optimal $\beta$, then form
+**No control variate.** See "Why no control variate?" above. The estimator is the plain antithetic average of discounted arithmetic payoffs:
 
-$$\widehat{C}_{\mathrm{arith}}^{\mathrm{CV}} = \widehat{C}_{\mathrm{arith}}^{\mathrm{MC}} - \hat\beta\,\Bigl(\widehat{C}_{\mathrm{geom}}^{\mathrm{MC}} - C_{\mathrm{geom}}^{\mathrm{exact}}\Bigr)$$
+$$\widehat{C}_{\mathrm{arith}} = \frac{1}{n}\sum_{i=1}^{n} e^{-rT}\,\bigl(\bar{A}^{(i)} - K\bigr)^+$$
 
-In practice $\hat\beta \approx 1$ and SE shrinks by 5-20× for SPY-like ATM smiles.
+with $n$ split half/half across $Z$ and $-Z$. Standard error is $O(1/\sqrt{n})$; bump `n_paths` if you need tighter CIs.
 
-**Greeks.** `compute_greeks()` runs central finite differences with **common random numbers** (`np.random.seed(42)` reset before each bump), so simulation noise cancels between $S \pm \delta S$ pairs. Vega applies an **absolute parallel shift** (`vol_bump_abs`) to the local-vol diffusion AND to the CV closed-form vol, so the control variate remains well-correlated even at non-ATM strikes. Pass `call=False` to compute_greeks for put greeks (delta < 0, etc.); the small-$T$ intrinsic fallback uses the forward-based payoff for the requested option type.
+**Greeks.** `compute_greeks()` runs central finite differences with **common random numbers** (`np.random.seed(42)` reset before each bump), so simulation noise cancels between $S \pm \delta S$ pairs. Vega applies an **absolute parallel shift** (`vol_bump_abs`) to the local-vol diffusion. Pass `call=False` for put greeks (delta < 0, etc.); the small-$T$ intrinsic fallback uses the forward-based payoff for the requested option type.
 
 ---
 
@@ -219,7 +216,7 @@ We are explicit about what this package does NOT model so you can decide whether
 ### Numerical caveats
 
 - **Dupire safety clamps mask data quality.** The four clamps (see `DupireLocalVol.clamp_stats`) prevent crashes when the input surface has noisy second derivatives, but they also hide problems. If `denom1_floor_pct > 5%` or `lv_cap_pct > 5%`, the local vol surface is not trustworthy in those regions — investigate the input IVs.
-- **Control variate is not strictly unbiased.** The CV target is the GBM closed-form geometric Asian price using a flat ATM vol; under local-vol dynamics the geometric MC has its own bias relative to that target. The `cv_bias_proxy = geom_mc - geom_exact` field lets you size this — it's typically a few cents for ATM 6M SPY, but can grow with skew.
+- **Antithetic only — no CV.** A geometric-Asian K-V control variate was tried and removed (bias under skew, see "Why no control variate?" above). If you need tighter CIs, scale `n_paths`. For a step up, dropping in Sobol/QMC paths in `simulate()` typically buys another order-of-magnitude variance reduction without bias risk; not implemented here.
 - **Discretization.** Euler-Maruyama is weak order 1; for very long maturities or high-vol regimes consider increasing `n_steps_per_obs`. Default `n_steps_per_obs=1` is appropriate for daily-or-finer averaging.
 - **Throughput.** 200k paths × 126 obs × 1 sub-step takes ~5-10 seconds on a modern laptop. PDE methods would be faster for vanilla payoffs but lose generality for path-dependence.
 
@@ -280,9 +277,9 @@ T, n_obs = 0.5, 126
 pricer = AsianMCPricer(S0=spot, r=r, T=T, n_obs=n_obs,
                        vol_surface=surface, local_vol_surface=local_vol)  # q from surface
 np.random.seed(42)
-res_call = pricer.price_asian(K=spot, n_paths=200_000, use_control_variate=True)
+res_call = pricer.price_asian(K=spot, n_paths=200_000)
 np.random.seed(42)
-res_put  = pricer.price_asian(K=spot, n_paths=200_000, use_control_variate=True, call=False)
+res_put  = pricer.price_asian(K=spot, n_paths=200_000, call=False)
 print(f"Asian call: ${res_call['price']:.4f}  +/- ${res_call['std_err']:.4f}")
 print(f"Asian put : ${res_put ['price']:.4f}  +/- ${res_put ['std_err']:.4f}")
 ```
@@ -361,11 +358,11 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 
 | Object | Description |
 |---|---|
-| `AsianMCPricer(S0, r, T, n_obs, vol_surface, local_vol_surface, n_steps_per_obs=1, flat_vol=None, vol_scale=1.0, vol_bump_abs=0.0, q=None)` | Monte Carlo pricer. `n_steps_per_obs` decouples Euler grid from averaging dates. `vol_scale` is a multiplicative bump on local vol; `vol_bump_abs` is an absolute parallel shift applied AFTER `vol_scale` to BOTH the diffusion and the CV closed-form vol (used by Vega in `compute_greeks`). `q` defaults to `vol_surface.q`. |
+| `AsianMCPricer(S0, r, T, n_obs, vol_surface, local_vol_surface, n_steps_per_obs=1, vol_scale=1.0, vol_bump_abs=0.0, q=None)` | Monte Carlo pricer (antithetic variates only — no CV). `n_steps_per_obs` decouples Euler grid from averaging dates. `vol_scale` is a multiplicative bump on local vol; `vol_bump_abs` is an absolute parallel shift applied AFTER `vol_scale` to the diffusion (used by Vega in `compute_greeks`). `q` defaults to `vol_surface.q`. |
 | `.simulate(n_paths, antithetic=True)` | Returns spot at every averaging date, shape `(n, n_obs)`. |
-| `.price_asian(K, n_paths=100_000, use_control_variate=True, call=True)` | Returns dict: `price, std_err, ci_95, cv_beta, geom_exact, geom_mc, geom_se, cv_bias_proxy`. Set `call=False` for puts. |
-| `geometric_asian_call_price(S0, K, r, sigma, T, n_obs, call=True, q=0.0)` | Kemna-Vorst closed form (CV target). Drift uses $r-q$; discount uses $r$. |
-| `compute_greeks(S0, K, r, T, n_obs, vol_surface, local_vol_surface, n_paths=150_000, n_steps_per_obs=1, seed=42, call=True, q=None)` | Finite-difference Delta / Gamma / Vega / Theta under common random numbers. Pass `call=False` for put greeks. `q` defaults to `vol_surface.q`. Vega uses an absolute parallel vol shift on both diffusion and CV. |
+| `.price_asian(K, n_paths=100_000, call=True)` | Returns dict: `price, std_err, ci_95, n_paths`. Set `call=False` for puts. |
+| `geometric_asian_call_price(S0, K, r, sigma, T, n_obs, call=True, q=0.0)` | Kemna-Vorst closed form. Drift uses $r-q$; discount uses $r$. Provided as a flat-vol benchmarking utility — not used internally by `price_asian`. |
+| `compute_greeks(S0, K, r, T, n_obs, vol_surface, local_vol_surface, n_paths=150_000, n_steps_per_obs=1, seed=42, call=True, q=None)` | Finite-difference Delta / Gamma / Vega / Theta under common random numbers. Pass `call=False` for put greeks. `q` defaults to `vol_surface.q`. Vega uses an absolute parallel vol shift on the diffusion. |
 
 ### Arbitrage diagnostics
 
