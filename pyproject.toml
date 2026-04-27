@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "spy-asian-pricer"
-version = "0.1.2"
+version = "0.1.3"
 description = "Arithmetic-average Asian option pricing on SPY under Dupire local volatility, calibrated from an SVI/JWSVI implied vol surface."
 readme = "README.md"
 license = "MIT"
