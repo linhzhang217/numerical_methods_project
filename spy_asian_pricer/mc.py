@@ -2,12 +2,18 @@
 
 Variance reduction:
     - Antithetic variates (paired ``Z`` and ``-Z`` draws).
-    - Geometric Asian control variate (Kemna & Vorst 1990 closed-form
-      under GBM with a flat vol).
+
+The Kemna & Vorst (1990) geometric-Asian control variate is intentionally
+NOT used: under a skewed local-vol surface the closed-form K-V target
+(which assumes GBM with a single flat ATM vol) systematically misses the
+true expectation of the geometric leg, and recentering it via a pilot MC
+costs more variance than it saves (see project notes).  The geometric
+closed form is still exposed as :func:`geometric_asian_call_price` for
+flat-vol benchmarking and unit tests, just not wired into ``price_asian``.
 
 Greeks (Delta, Gamma, Vega, Theta) are computed via finite-difference
-repricing under common random numbers, with a multiplicative vol bump
-applied consistently to the local vol diffusion and the CV closed-form vol.
+repricing under common random numbers.  Vega applies an absolute parallel
+shift (``vol_bump_abs``) directly to the local vol diffusion.
 """
 
 from __future__ import annotations
@@ -33,11 +39,10 @@ def geometric_asian_call_price(
 ) -> float:
     """Closed-form discrete geometric Asian price under GBM (Kemna-Vorst).
 
-    Drift uses ``r - q`` (continuous dividend yield).  Discounting still uses
-    ``r``.  Used as the control variate target; the closed-form assumes
-    constant sigma but remains a high-correlation control under local vol.
-    Use ``geom_mc - geom_exact`` from :meth:`AsianMCPricer.price_asian` to
-    size the bias.
+    Drift uses ``r - q`` (continuous dividend yield); discounting uses ``r``.
+    Provided as a public utility for flat-vol benchmarking and unit tests.
+    NOT used internally by ``AsianMCPricer.price_asian`` (CV was removed —
+    see module docstring).
     """
     N = n_obs
     b = r - q  # cost of carry
@@ -75,25 +80,20 @@ class AsianMCPricer:
     n_obs : int
         Number of averaging dates.
     vol_surface : JWSVIVolSurface
-        Implied vol surface (used for ATM IV / CV vol selection).
+        Implied vol surface (used for ATM IV reporting).
     local_vol_surface : DupireLocalVol
         Local vol surface used for the Euler-Maruyama diffusion.
     n_steps_per_obs : int, default 1
         Euler steps per averaging interval (decouples averaging grid from
         simulation grid so coarse averaging keeps a fine Euler discretization).
-    flat_vol : float, optional
-        Override the flat vol used by the geometric-Asian CV closed-form.
-        Defaults to ``ATM IV at (S0, T) * vol_scale + vol_bump_abs``.
     vol_scale : float, default 1.0
         Multiplicative bump applied to local vol (sticky-vol-ratio style).
     vol_bump_abs : float, default 0.0
-        Absolute parallel shift added to local vol AFTER ``vol_scale``.  The
-        same shift is added to ``flat_vol`` so the CV closed-form stays
-        consistent with the diffusion (which previously didn't hold for
-        non-ATM strikes — see ``compute_greeks``).
+        Absolute parallel shift added to local vol AFTER ``vol_scale``.
+        Used by ``compute_greeks`` to compute Vega.
     q : float, default 0.0
         Continuous dividend yield. Drift in the Euler step is ``r - q``.
-        If 0 and ``vol_surface.q != 0``, falls back to ``vol_surface.q``.
+        If None, falls back to ``vol_surface.q``.
     """
 
     def __init__(
@@ -105,7 +105,6 @@ class AsianMCPricer:
         vol_surface: JWSVIVolSurface,
         local_vol_surface: DupireLocalVol,
         n_steps_per_obs: int = 1,
-        flat_vol: Optional[float] = None,
         vol_scale: float = 1.0,
         vol_bump_abs: float = 0.0,
         q: Optional[float] = None,
@@ -124,12 +123,8 @@ class AsianMCPricer:
         self.local_vol_surface = local_vol_surface
         self.vol_scale = float(vol_scale)
         self.vol_bump_abs = float(vol_bump_abs)
-
-        if flat_vol is not None:
-            self.flat_vol = float(flat_vol)
-        else:
-            atm_iv = vol_surface.implied_vol(np.array([S0]), T)[0]
-            self.flat_vol = float(atm_iv * self.vol_scale + self.vol_bump_abs)
+        # ATM IV diagnostic — useful for reporting; no longer drives any logic.
+        self.atm_iv = float(vol_surface.implied_vol(np.array([S0]), T)[0])
 
     def simulate(self, n_paths: int, antithetic: bool = True) -> np.ndarray:
         """Simulate spot at every averaging date.
@@ -177,65 +172,32 @@ class AsianMCPricer:
         self,
         K: float,
         n_paths: int = 100_000,
-        use_control_variate: bool = True,
         call: bool = True,
     ) -> Dict[str, float]:
         """Price an arithmetic-average Asian option.
 
-        Returns a dict with keys: price, std_err, ci_95, cv_beta, geom_exact,
-        geom_mc, geom_se, cv_bias_proxy.
+        Antithetic variates only (CV was removed — see module docstring).
+        Returns a dict with keys: ``price, std_err, ci_95, n_paths``.
         """
         S = self.simulate(n_paths)
         n_actual = S.shape[0]
         df = np.exp(-self.r * self.T)
 
         A_arith = S.mean(axis=1)
-        A_geom = np.exp(np.log(S).mean(axis=1))
-
         if call:
-            payoff_arith = np.maximum(A_arith - K, 0.0)
-            payoff_geom = np.maximum(A_geom - K, 0.0)
+            payoff = np.maximum(A_arith - K, 0.0)
         else:
-            payoff_arith = np.maximum(K - A_arith, 0.0)
-            payoff_geom = np.maximum(K - A_geom, 0.0)
+            payoff = np.maximum(K - A_arith, 0.0)
 
-        geom_price_exact = geometric_asian_call_price(
-            self.S0,
-            K,
-            self.r,
-            self.flat_vol,
-            self.T,
-            self.n_obs,
-            call=call,
-            q=self.q,
-        )
-
-        disc_payoff_arith = df * payoff_arith
-        disc_payoff_geom = df * payoff_geom
-
-        if use_control_variate:
-            cov_mat = np.cov(disc_payoff_arith, disc_payoff_geom)
-            beta = cov_mat[0, 1] / max(cov_mat[1, 1], 1e-12)
-            adjusted = disc_payoff_arith - beta * (disc_payoff_geom - geom_price_exact)
-            price = float(adjusted.mean())
-            std_err = float(adjusted.std(ddof=1) / np.sqrt(n_actual))
-        else:
-            beta = float("nan")
-            price = float(disc_payoff_arith.mean())
-            std_err = float(disc_payoff_arith.std(ddof=1) / np.sqrt(n_actual))
-
-        geom_mc = float(disc_payoff_geom.mean())
-        geom_se = float(disc_payoff_geom.std(ddof=1) / np.sqrt(n_actual))
+        disc_payoff = df * payoff
+        price = float(disc_payoff.mean())
+        std_err = float(disc_payoff.std(ddof=1) / np.sqrt(n_actual))
 
         return {
             "price": price,
             "std_err": std_err,
             "ci_95": (price - 1.96 * std_err, price + 1.96 * std_err),
-            "cv_beta": float(beta),
-            "geom_exact": float(geom_price_exact),
-            "geom_mc": geom_mc,
-            "geom_se": geom_se,
-            "cv_bias_proxy": geom_mc - float(geom_price_exact),
+            "n_paths": int(n_actual),
         }
 
 
@@ -260,9 +222,10 @@ def compute_greeks(
         - Vol:   +/- 1 absolute vol pt  -> Vega        (per 1 vol point)
         - Time:  -1 calendar day        -> Theta       (per calendar day)
 
-    Vol bump is an absolute parallel shift applied identically to the
-    diffusion (``vol_bump_abs``) and the CV closed-form vol, so the control
-    variate stays well-correlated even at non-ATM strikes.
+    Vol bump is an absolute parallel shift (``vol_bump_abs``) applied to the
+    local-vol diffusion only — the CV is no longer used (see module
+    docstring), so there is no longer a "consistency" constraint between
+    diffusion and a control-variate vol.
 
     Theta uses CRN with the same Z-matrix shape as the base run; the only
     change is ``dt = T_use / n_steps``, which means CRN is *approximate* for
@@ -307,9 +270,7 @@ def compute_greeks(
             q=q,
         )
         np.random.seed(seed)
-        return float(
-            p.price_asian(K, n_paths, use_control_variate=True, call=call)["price"]
-        )
+        return float(p.price_asian(K, n_paths, call=call)["price"])
 
     P0 = price_with(S0)
     P_up = price_with(S0 + dS)
