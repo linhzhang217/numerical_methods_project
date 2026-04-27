@@ -94,11 +94,12 @@ Each pipeline stage maps 1-to-1 onto a module in `spy_asian_pricer/`. Below is w
 
 - **Forward with dividends**: $F = S\, e^{(r-q) T}$. The continuous-equivalent dividend yield $q$ is pulled from `Ticker.info` via `fetch_dividend_yield()` (yfinance returns it as either a fraction or a percent depending on version; the helper normalizes). Default fallback is 1.3% (SPY).
 - **OTM-only filter**: puts with $K \le F$ + calls with $K > F$. ITM IVs are noisy (small extrinsic value).
-- **Liquidity filter**: drop strikes with `openInterest <= 10`.
+- **Re-imply IV from `lastPrice`**: Yahoo's own `impliedVolatility` column is **discarded** and replaced via `implied_vol_from_price()` using the same $r, q$ that the rest of the pipeline uses. Yahoo's IV is computed by their own solver against an unspecified $r$ and $q$, and outside US trading hours it returns ~$10^{-5}$ for almost every strike (solver fails on stale `lastPrice`). Re-implying locally fixes both the inconsistency and the weekend/pre-market breakage; the resulting IV is only as fresh as the most recent trade for that strike.
+- **Liquidity filter**: keep only strikes with `volume > 0` (default `min_volume=0`).  Yahoo's `volume` persists the previous trading session over weekends, so this filter is well-defined any time of week and limits staleness to ≤1 trading day.  Open interest is NOT used because Yahoo's OI snapshot is broken outside market hours (returns sub-30 even for liquid SPY strikes whose true OI is in the thousands).
 - **Moneyness band**: keep only $K \in [0.7\, S, 1.3\, S]$ to avoid deep-tail garbage.
 - **Per-slice minimum**: discard any expiry with fewer than 5 surviving strikes.
 
-Output: a `dict` of DataFrames keyed by expiry string, each carrying `strike`, `impliedVolatility`, `dcf`, `fwd`, `logMoneyness`.
+Output: a `dict` of DataFrames keyed by expiry string, each carrying `strike`, `impliedVolatility` (re-implied), `dcf`, `fwd`, `logMoneyness`.
 
 ### 2. SVI calibration (`svi.py`)
 
@@ -209,9 +210,9 @@ We are explicit about what this package does NOT model so you can decide whether
 ### Model assumptions
 
 - **Pure local volatility.** The diffusion is $dS = (r - q) S\,dt + \sigma_{\mathrm{loc}}(S, t) S\, dW$. There is no stochastic vol component (no Heston, SABR, rough vol), no vol-of-vol, no jumps, no leverage effect beyond what's baked into the surface. For long-dated forward-skew-sensitive payoffs this matters — local vol is well-known to under-price forward-start volatility.
-- **Constant risk-free rate.** Default $r = 4.3\%$, no term structure, no stochastic rates. Fine for short-to-medium SPY tenors; questionable for multi-year LEAPS.
+- **Constant (single-tenor) risk-free rate.** $r$ is fetched once via `fetch_risk_free_rate(tenor_years=...)` from Yahoo's Treasury curve (`^IRX` / `^FVX` / `^TNX` / `^TYX`) at the option's tenor, then held constant through the simulation. No term structure inside the SDE, no stochastic rates. Fine for short-to-medium SPY tenors; for multi-year LEAPS or tenors that straddle large rate moves you'd want a full curve.
 - **Dividends as a continuous yield.** $q$ is fetched from `Ticker.info['dividendYield']` (or `trailingAnnualDividendYield`) via `fetch_dividend_yield()`, fallback 1.3% for SPY. Discrete dividends, ex-div jumps, and irregular payment schedules are not modeled — the continuous-yield approximation is good enough for index ETFs but biased for single names with concentrated payouts.
-- **Mid-vol calibration.** We use Yahoo Finance's `impliedVolatility` field, which is a mid quote — no bid-ask spread modeling, no order book.
+- **Last-price IV (not mid).** We re-imply IV from Yahoo's `lastPrice` (last trade) via `implied_vol_from_price()`, NOT from bid/ask mid. The `lastPrice` is fresher than Yahoo's own `impliedVolatility` column outside market hours, but for illiquid strikes it can still be stale by hours or days, so the calibrated surface reflects the most recent traded prints rather than live mid quotes. yfinance does not expose reliable bid/ask, so a true mid-IV path would require a different data source (Polygon, Tradier, IB).
 
 ### Numerical caveats
 
@@ -252,12 +253,12 @@ pip install spy-asian-pricer[data,plot] # full — recommended for the demo note
 import numpy as np
 from spy_asian_pricer import (
     calibrate_svi, JWSVIVolSurface, DupireLocalVol, AsianMCPricer,
-    fetch_spot, fetch_dividend_yield, build_vol_grid,
+    fetch_spot, fetch_dividend_yield, fetch_risk_free_rate, build_vol_grid,
 )
 
 spot = fetch_spot("SPY")
-r = 0.043
-q = fetch_dividend_yield("SPY")           # ~1.3% for SPY (auto-normalized)
+r = fetch_risk_free_rate(tenor_years=0.5)  # Yahoo ^IRX/^FVX interpolation
+q = fetch_dividend_yield("SPY")            # ~1.3% for SPY (auto-normalized)
 vol_data = build_vol_grid("SPY", spot=spot, r=r, q=q)
 
 # Per-expiry SVI -> JWSVI -> surface
@@ -324,9 +325,12 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 | Object | Description |
 |---|---|
 | `fetch_spot(ticker="SPY") -> float` | Most recent close from yfinance. |
+| `fetch_risk_free_rate(tenor_years=0.25, default=0.043) -> float` | Risk-free rate from Yahoo Treasury yields (`^IRX` 13W → `^FVX` 5Y → `^TNX` 10Y → `^TYX` 30Y), linearly interpolated by tenor. Yahoo quotes percent; helper divides by 100. Falls back to `default` on missing fields or network errors. |
 | `fetch_dividend_yield(ticker="SPY", default=0.013) -> float` | Continuous-equivalent dividend yield from `Ticker.info`. Auto-normalizes the yfinance "fraction vs percent" inconsistency. Falls back to `default` on missing fields or network errors. |
-| `build_vol_grid(ticker="SPY", spot=None, r=0.043, q=None, ...)` | Pulls option chains and builds the per-expiry IV grid. When `q` is None it is fetched via `fetch_dividend_yield`. Returns `{expiry_str: DataFrame}`. |
-| `select_expiries(ticker="SPY", max_expiries=12, ...)` | Helper to pick evenly-spaced expiries within a DTE band. |
+| `build_vol_grid(ticker="SPY", spot=None, r=0.043, q=None, ...)` | Pulls option chains and builds the per-expiry IV grid.  IV column is re-implied from `lastPrice` via `implied_vol_from_price` (Yahoo's own IV is discarded). When `q` is None it is fetched via `fetch_dividend_yield`. Returns `{expiry_str: DataFrame}`. |
+| `select_expiries(ticker="SPY", max_expiries=None, ...)` | Helper to pick expiries within a DTE band (default `[2 days, 7 years]`).  `max_expiries=None` returns every expiry in the band (matches eqdquant's `vol_surface_date_filter` "use everything inside cutoff" convention); pass an integer to evenly sub-sample. |
+| `bs_european_price(S, K, r, q, sigma, T, call=True) -> float` | Black-Scholes European option price with continuous dividend yield. |
+| `implied_vol_from_price(price, S, K, r, q, T, call=True) -> float` | Reverse-imply BS volatility from an observed option price (Brent on `[1e-4, 5.0]`).  Returns `NaN` if price is below forward intrinsic or solver brackets fail. |
 
 ### Calibration
 

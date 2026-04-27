@@ -6,9 +6,12 @@ Optional: requires the ``yfinance`` and ``pandas`` extras (install via
 
 from __future__ import annotations
 
+import warnings
 from typing import Dict, List, Optional
 
 import numpy as np
+from scipy.optimize import brentq
+from scipy.stats import norm
 
 try:
     import pandas as pd
@@ -20,9 +23,137 @@ except ImportError as e:  # pragma: no cover - exercised only without extras
     ) from e
 
 
+# ─────────────────────────────────────────────────────────────────────────
+# Black-Scholes helpers (used to re-imply IV from lastPrice, since Yahoo's
+# own `impliedVolatility` field is unreliable outside US market hours).
+# ─────────────────────────────────────────────────────────────────────────
+
+def bs_european_price(
+    S: float,
+    K: float,
+    r: float,
+    q: float,
+    sigma: float,
+    T: float,
+    call: bool = True,
+) -> float:
+    """Black-Scholes European option price with continuous dividend yield ``q``."""
+    if T <= 0:
+        return max(S - K, 0.0) if call else max(K - S, 0.0)
+    if sigma <= 0:
+        fwd = S * np.exp((r - q) * T)
+        df_ = np.exp(-r * T)
+        intr = max(fwd - K, 0.0) if call else max(K - fwd, 0.0)
+        return df_ * intr
+    sd = sigma * np.sqrt(T)
+    d1 = (np.log(S / K) + (r - q + 0.5 * sigma ** 2) * T) / sd
+    d2 = d1 - sd
+    if call:
+        return S * np.exp(-q * T) * norm.cdf(d1) - K * np.exp(-r * T) * norm.cdf(d2)
+    return K * np.exp(-r * T) * norm.cdf(-d2) - S * np.exp(-q * T) * norm.cdf(-d1)
+
+
+def implied_vol_from_price(
+    price: float,
+    S: float,
+    K: float,
+    r: float,
+    q: float,
+    T: float,
+    call: bool = True,
+    lo: float = 1e-4,
+    hi: float = 5.0,
+) -> float:
+    """Reverse-imply Black-Scholes volatility from an observed option price.
+
+    Uses Brent on ``[lo, hi]``.  Returns ``NaN`` if the price is below the
+    no-arbitrage forward intrinsic, or if the solver brackets fail.
+
+    NOTE on staleness: ``price`` here is Yahoo's ``lastPrice`` (last trade,
+    not mid).  For illiquid strikes this can be hours or days old, so the
+    re-implied IV is only as fresh as the most recent trade.  In practice
+    SPY ATM strikes update intraday; deep-OTM wings can lag a session.
+    """
+    if not np.isfinite(price) or price <= 0 or T <= 0:
+        return float("nan")
+    fwd = S * np.exp((r - q) * T)
+    df_ = np.exp(-r * T)
+    intr = df_ * (max(fwd - K, 0.0) if call else max(K - fwd, 0.0))
+    if price <= intr + 1e-8:
+        return float("nan")
+    try:
+        return float(
+            brentq(
+                lambda v: bs_european_price(S, K, r, q, v, T, call) - price,
+                lo,
+                hi,
+                xtol=1e-6,
+                maxiter=100,
+            )
+        )
+    except (ValueError, RuntimeError):
+        return float("nan")
+
+
 def fetch_spot(ticker: str = "SPY") -> float:
     """Most recent close for ``ticker``."""
     return float(yf.Ticker(ticker).history(period="1d")["Close"].iloc[-1])
+
+
+def fetch_risk_free_rate(
+    tenor_years: float = 0.25,
+    default: float = 0.043,
+) -> float:
+    """Risk-free rate from Yahoo Finance Treasury-yield tickers.
+
+    Picks the closest available point (or linearly interpolates between
+    bracketing points) on the Treasury yield curve:
+
+        ^IRX  -- 13-week T-bill   (~0.25y)
+        ^FVX  -- 5-year T-note    (5y)
+        ^TNX  -- 10-year T-note   (10y)
+        ^TYX  -- 30-year T-bond   (30y)
+
+    Yahoo quotes these in *percent* (e.g. 4.30 means 4.30%); the helper
+    divides by 100.  For ``tenor_years < 0.25`` ^IRX is reused.  For
+    ``tenor_years > 30`` ^TYX is reused.
+
+    The returned value is treated as a continuously-compounded rate by
+    the rest of the package; the difference vs the bond-equivalent yield
+    Yahoo actually quotes is < 10 bp on a 4% rate at 1y maturity --
+    acceptable for the SPY-equity scope of this package.
+
+    Falls back to ``default`` if yfinance throws or returns NaN.
+    """
+    nodes = [(0.25, "^IRX"), (5.0, "^FVX"), (10.0, "^TNX"), (30.0, "^TYX")]
+
+    def _pull(ticker: str) -> Optional[float]:
+        try:
+            v = float(yf.Ticker(ticker).history(period="5d")["Close"].iloc[-1])
+            if np.isfinite(v) and v > 0:
+                return v / 100.0  # percent -> fraction
+        except Exception:
+            pass
+        return None
+
+    t = float(tenor_years)
+    if t <= nodes[0][0]:
+        v = _pull(nodes[0][1])
+        return v if v is not None else float(default)
+    if t >= nodes[-1][0]:
+        v = _pull(nodes[-1][1])
+        return v if v is not None else float(default)
+
+    # Bracket and linearly interpolate
+    for (t_lo, tk_lo), (t_hi, tk_hi) in zip(nodes, nodes[1:]):
+        if t_lo <= t <= t_hi:
+            v_lo = _pull(tk_lo)
+            v_hi = _pull(tk_hi)
+            if v_lo is None or v_hi is None:
+                return v_lo if v_lo is not None else (v_hi if v_hi is not None else float(default))
+            w = (t - t_lo) / (t_hi - t_lo)
+            return float((1 - w) * v_lo + w * v_hi)
+    return float(default)
 
 
 def fetch_dividend_yield(
@@ -56,12 +187,16 @@ def fetch_dividend_yield(
 
 def select_expiries(
     ticker: str = "SPY",
-    max_expiries: int = 12,
+    max_expiries: Optional[int] = None,
     min_dte: int = 2,
     max_dte: int = 365 * 7,
 ) -> List[str]:
-    """Return up to ``max_expiries`` evenly spaced expiry strings within
-    ``[min_dte, max_dte]`` calendar days.
+    """Return all expiry strings in ``[min_dte, max_dte]`` calendar days.
+
+    By default (``max_expiries=None``) returns every expiry within the DTE
+    band, matching the eqdquant ``vol_surface_date_filter`` convention of
+    "use everything inside a 7-year cutoff".  Pass an integer to evenly
+    sub-sample down to that count.
     """
     tkr = yf.Ticker(ticker)
     today = pd.Timestamp.today().normalize()
@@ -70,7 +205,7 @@ def select_expiries(
         dte = (pd.Timestamp(exp_str) - today).days
         if min_dte <= dte <= max_dte:
             expiries.append(exp_str)
-    if len(expiries) > max_expiries:
+    if max_expiries is not None and len(expiries) > max_expiries:
         idx = np.linspace(0, len(expiries) - 1, max_expiries, dtype=int)
         expiries = [expiries[i] for i in idx]
     return expiries
@@ -83,7 +218,7 @@ def build_vol_grid(
     q: Optional[float] = None,
     expiries: Optional[List[str]] = None,
     moneyness_band: float = 0.3,
-    min_open_interest: int = 10,
+    min_volume: int = 0,
     min_strikes_per_slice: int = 5,
 ) -> Dict[str, "pd.DataFrame"]:
     """Pull option chains and build the per-expiry IV smile grid.
@@ -91,8 +226,21 @@ def build_vol_grid(
     Forward uses ``spot * exp((r - q) * dcf)``.  When ``q`` is None the
     dividend yield is fetched from yfinance via :func:`fetch_dividend_yield`.
 
+    The ``impliedVolatility`` column is **re-implied locally** from
+    ``lastPrice`` via :func:`implied_vol_from_price` using the ``r``, ``q``
+    actually passed into this function.  Yahoo's own ``impliedVolatility``
+    field is ignored because it is unreliable outside US market hours.
+
+    Liquidity filter is ``volume > min_volume`` (default 0, i.e. "any
+    positive volume").  Yahoo's ``volume`` persists the previous trading
+    session's totals over weekends, so this filter is well-defined any
+    time of week.  Open interest is NOT used because Yahoo's OI snapshot
+    is broken outside market hours (returns sub-30 even for liquid SPY
+    strikes whose true OI is in the thousands).
+
     Returns ``{expiry_str: DataFrame}`` with columns:
-        strike, impliedVolatility, dte, dcf, fwd, logMoneyness.
+        strike, impliedVolatility, lastPrice, volume, openInterest, optType,
+        dte, dcf, fwd, logMoneyness.
     """
     tkr = yf.Ticker(ticker)
     today = pd.Timestamp.today().normalize()
@@ -119,12 +267,29 @@ def build_vol_grid(
 
         otm_puts = puts[puts["strike"] <= fwd].copy()
         otm_calls = calls[calls["strike"] > fwd].copy()
+
+        # Re-imply IV from lastPrice using OUR (r, q).  Yahoo's own
+        # impliedVolatility column is overwritten because it's unreliable
+        # outside US market hours (returns ~1e-5 when the solver fails).
+        otm_puts["impliedVolatility"] = otm_puts.apply(
+            lambda x: implied_vol_from_price(
+                x["lastPrice"], spot, x["strike"], r, q, dcf, call=False
+            ),
+            axis=1,
+        )
+        otm_calls["impliedVolatility"] = otm_calls.apply(
+            lambda x: implied_vol_from_price(
+                x["lastPrice"], spot, x["strike"], r, q, dcf, call=True
+            ),
+            axis=1,
+        )
         df = pd.concat([otm_puts, otm_calls], ignore_index=True)
+        df = df.dropna(subset=["impliedVolatility"]).copy()  # drop solver failures
 
         df = df[
             (df["impliedVolatility"] > 0.01)
             & (df["impliedVolatility"] < 2.0)
-            & (df["openInterest"] > min_open_interest)
+            & (df["volume"].fillna(0) > min_volume)
         ].copy()
 
         lo = (1.0 - moneyness_band) * spot
@@ -139,4 +304,19 @@ def build_vol_grid(
             df = df.sort_values("strike").reset_index(drop=True)
             vol_data[exp_str] = df
 
+    if len(vol_data) < 2:
+        warnings.warn(
+            f"build_vol_grid: only {len(vol_data)} expiry slice(s) survived "
+            f"the filters (min_volume={min_volume}, "
+            f"min_strikes_per_slice={min_strikes_per_slice}, "
+            f"moneyness_band={moneyness_band}). JWSVIVolSurface and "
+            "DupireLocalVol both require >=2 tenors. Try lowering "
+            "min_strikes_per_slice, widening moneyness_band, or passing "
+            "`expiries=` manually.  The min_volume=0 default already keeps "
+            "any strike that has ever traded recently; if that is still "
+            "empty, Yahoo is returning a degenerate chain (try a different "
+            "ticker or wait for market hours).",
+            RuntimeWarning,
+            stacklevel=2,
+        )
     return vol_data

@@ -29,6 +29,12 @@ class DupireLocalVol:
     LV_OVER_ATM_CAP = 10.0
 
     def __init__(self, vol_surface: JWSVIVolSurface) -> None:
+        if len(vol_surface.dcfs) < 2:
+            raise ValueError(
+                f"DupireLocalVol needs at least 2 calibrated tenors for the "
+                f"per-strike cubic spline in T; the surface has only "
+                f"{len(vol_surface.dcfs)}. Add more expiries in build_vol_grid."
+            )
         self.vol_surface = vol_surface
         self.spot = vol_surface.spot
         self.r = vol_surface.r

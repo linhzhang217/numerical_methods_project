@@ -52,6 +52,14 @@ class JWSVIVolSurface:
         r: float,
         q: float = 0.0,
     ) -> None:
+        if len(jwsvi_slices) < 2:
+            raise ValueError(
+                f"JWSVIVolSurface requires at least 2 expiry slices for time "
+                f"interpolation; got {len(jwsvi_slices)}. Common cause: "
+                "build_vol_grid filtered out too many expiries. Try lowering "
+                "min_open_interest (e.g. to 0 or 1) or min_strikes_per_slice "
+                "in data.build_vol_grid, or pass `expiries=` manually."
+            )
         self.spot = float(spot)
         self.r = float(r)
         self.q = float(q)

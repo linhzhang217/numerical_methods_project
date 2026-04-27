@@ -23,9 +23,12 @@ from .svi import JWSVIParam, SVIParam, calibrate_svi
 # data.py is optional (yfinance / pandas extras); expose helpers when present.
 try:
     from .data import (  # noqa: F401  -- re-exported
+        bs_european_price,
         build_vol_grid,
         fetch_dividend_yield,
+        fetch_risk_free_rate,
         fetch_spot,
+        implied_vol_from_price,
         select_expiries,
     )
     _DATA_OK = True
@@ -46,6 +49,14 @@ __all__ = [
     "check_spread_arbitrage",
 ]
 if _DATA_OK:
-    __all__ += ["build_vol_grid", "fetch_dividend_yield", "fetch_spot", "select_expiries"]
+    __all__ += [
+        "bs_european_price",
+        "build_vol_grid",
+        "fetch_dividend_yield",
+        "fetch_risk_free_rate",
+        "fetch_spot",
+        "implied_vol_from_price",
+        "select_expiries",
+    ]
 
-__version__ = "0.1.4"
+__version__ = "0.1.3"
