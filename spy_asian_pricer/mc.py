@@ -173,13 +173,25 @@ class AsianMCPricer:
         K: float,
         n_paths: int = 100_000,
         call: bool = True,
+        antithetic: bool = True,
     ) -> Dict[str, float]:
         """Price an arithmetic-average Asian option.
 
-        Antithetic variates only (CV was removed — see module docstring).
+        Variance reduction is antithetic-only (no control variate; see
+        module docstring).  Set ``antithetic=False`` to compare plain MC.
+
+        **Standard error** is computed correctly for the chosen mode:
+          - ``antithetic=True``: SE is the std of the ``n_paths/2`` pair
+            averages ``(f(Z_i) + f(-Z_i))/2`` divided by ``sqrt(n_paths/2)``.
+            This is the textbook antithetic estimator and *does* reflect
+            the negative pair correlation that drives the variance gain.
+            (Naive ``std(disc_payoff) / sqrt(n_paths)`` would treat the
+            paired samples as iid and underestimate the variance reduction.)
+          - ``antithetic=False``: usual ``std(disc_payoff) / sqrt(n_paths)``.
+
         Returns a dict with keys: ``price, std_err, ci_95, n_paths``.
         """
-        S = self.simulate(n_paths)
+        S = self.simulate(n_paths, antithetic=antithetic)
         n_actual = S.shape[0]
         df = np.exp(-self.r * self.T)
 
@@ -191,7 +203,16 @@ class AsianMCPricer:
 
         disc_payoff = df * payoff
         price = float(disc_payoff.mean())
-        std_err = float(disc_payoff.std(ddof=1) / np.sqrt(n_actual))
+
+        if antithetic:
+            # ``simulate(antithetic=True)`` returns ``vstack([Z, -Z])``, so
+            # the first ``n_half`` rows of S are driven by ``Z`` and the
+            # last ``n_half`` by ``-Z``.  Average each pair, then SE.
+            n_half = n_actual // 2
+            pair_avg = 0.5 * (disc_payoff[:n_half] + disc_payoff[n_half:])
+            std_err = float(pair_avg.std(ddof=1) / np.sqrt(n_half))
+        else:
+            std_err = float(disc_payoff.std(ddof=1) / np.sqrt(n_actual))
 
         return {
             "price": price,
