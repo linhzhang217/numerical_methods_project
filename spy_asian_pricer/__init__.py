@@ -4,7 +4,7 @@ Pipeline
 --------
 1. Fetch SPY option chains (yfinance, optional extra)
 2. Per-expiry SVI calibration -> raw 5-parameter slice
-3. SVI -> JWSVI conversion + time interpolation (WingDerived nu_tilda)
+3. SVI -> JWSVI conversion + time interpolation (wing-derived nu_tilda)
 4. Dupire local vol via cubic-spline dw/dT + Gatheral denominator
 5. Monte Carlo pricing (Euler-Maruyama, antithetic)
 6. Greeks via finite-difference repricing under common random numbers

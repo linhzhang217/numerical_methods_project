@@ -1,7 +1,6 @@
 """JWSVI volatility surface with time interpolation.
 
-Implements the WingDerived ``nu_tilda`` reconstruction (matches qlcore's
-``jwsvi_c_nt2``):
+Re-derives ``nu_tilda`` from the wing slopes:
 
     - Interpolate (nu * t), phi, p, c linearly (cubic if more than 3 slices).
     - Re-derive nu_tilda from wing slopes:  nu_tilda = 4 * nu * p * c / (p + c)^2.
@@ -85,7 +84,9 @@ class JWSVIVolSurface:
 
     @staticmethod
     def _compute_nu_tilda(nu: float, p: float, c: float) -> float:
-        """Re-derive nu_tilda from wing slopes (qlcore jwsvi_c_nt2 convention).
+        """Re-derive nu_tilda from wing slopes.
+
+        Formula: ``nu_tilda = 4 * nu * p * c / (p + c) ** 2``.
 
         Clip into [NUTILDA_FLOOR, 0.99 * nu]:
           - upper cap at 0.99 * nu so ``to_svi`` keeps ``nu - nu_tilda > 0``;

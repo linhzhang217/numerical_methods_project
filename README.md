@@ -14,7 +14,7 @@ Pricing path-dependent payoffs on a real index requires more than Black-Scholes 
 Yahoo Finance option chains
    -> SVI calibration (per expiry slice)
    -> SVI -> JWSVI conversion
-   -> JWSVI time interpolation (WingDerived nu_tilda)
+   -> JWSVI time interpolation (wing-derived nu_tilda)
    -> Arbitrage diagnostics (butterfly / calendar / spread)
    -> Dupire local vol  (cubic-spline dw/dT, Gatheral denominator)
    -> Monte Carlo  (Euler-Maruyama + antithetic variates)
@@ -90,7 +90,7 @@ Raw SVI parameters $(a, b, \rho, m, \sigma)$ have no direct financial interpreta
 | $\tilde\nu$ | minimum total variance (smile floor) |
 | $\mathrm{conv}$ | convexity |
 
-Because each parameter is a *financial* quantity, smooth time interpolation in JWSVI space produces a sensible, calendar-arbitrage-free surface even with sparse expiry coverage. We use the **WingDerived** mode: $(\nu T, \phi, p, c)$ are interpolated linearly (cubic if $>3$ slices), and $\tilde\nu$ is re-derived from the wing slopes via $\tilde\nu = 4\nu p c / (p+c)^2$, then clipped to $[10^{-6},\, 0.99\,\nu]$ (the `NUTILDA_FLOOR` constant) so the SVI radius stays well-defined and $\nu - \tilde\nu \ge 0$ always.
+Because each parameter is a *financial* quantity, smooth time interpolation in JWSVI space produces a sensible, calendar-arbitrage-free surface even with sparse expiry coverage. We interpolate $(\nu T, \phi, p, c)$ linearly (cubic if $>3$ slices), and $\tilde\nu$ is re-derived from the wing slopes via $\tilde\nu = 4\nu p c / (p+c)^2$, then clipped to $[10^{-6},\, 0.99\,\nu]$ (the `NUTILDA_FLOOR` constant) so the SVI radius stays well-defined and $\nu - \tilde\nu \ge 0$ always.
 
 ### Why three arbitrage checks?
 
@@ -145,7 +145,7 @@ Closed-form transformation, no fitting. The 5 raw SVI parameters map to the 6 JW
 
 ### 4. Time interpolation (`surface.py`)
 
-`JWSVIVolSurface` interpolates **WingDerived** mode (matches qlcore's `jwsvi_c_nt2`):
+`JWSVIVolSurface` interpolates each JWSVI parameter across tenors and re-derives $\tilde\nu$ from the wing slopes at every target tenor:
 
 - $(\nu T, \phi, p, c)$ are interpolated **linearly** when $\le 3$ tenors, **cubic** otherwise. Linear keeps $\nu T$ monotone non-decreasing, which is necessary for calendar-arbitrage-free reconstruction.
 - $\tilde\nu$ is **re-derived** from wing slopes at every target tenor: $\tilde\nu = 4 \nu p c / (p + c)^2$, then **clipped to $[10^{-6},\, 0.99\,\nu]$ (the `NUTILDA_FLOOR` constant)** so the SVI radius reconstruction in `to_svi` always sees $\nu - \tilde\nu > 0$.
@@ -409,7 +409,7 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 
 | Object | Description |
 |---|---|
-| `JWSVIVolSurface(jwsvi_slices, spot, r, q=0.0)` | Per-slice JWSVI + WingDerived $\tilde\nu$ time interpolation. `q` is continuous dividend yield used in `forward(dcf) = spot * exp((r - q) * dcf)`. |
+| `JWSVIVolSurface(jwsvi_slices, spot, r, q=0.0)` | Per-slice JWSVI with wing-derived $\tilde\nu$ time interpolation. `q` is continuous dividend yield used in `forward(dcf) = spot * exp((r - q) * dcf)`. |
 | `SSVISurface(dcfs, thetas, eta, rho, gamma, spot, r, q=0.0)` | Gatheral SSVI surface (joint $(\eta, \rho, \gamma)$ + monotone $\theta(t)$).  Calendar-arb-free by construction.  Same consumer API as `JWSVIVolSurface`; plugs into `DupireLocalVol` via duck-typed `get_svi_at(dcf)`. |
 | `calibrate_ssvi(vol_data, spot, r, q=0.0, mode='pinned')` | Build an `SSVISurface` from `vol_data`.  `mode='pinned'`: 3-param fit, $\theta(t)$ = market ATM.  `mode='full'`: 3+N param fit with monotone $\theta(t)$ (cumsum-of-squares parameterisation). |
 | `.forward(dcf) -> float` | Forward price at tenor `dcf`. |
