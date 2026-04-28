@@ -431,7 +431,7 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 |---|---|
 | `AsianMCPricer(S0, r, T, n_obs, vol_surface, local_vol_surface, n_steps_per_obs=1, vol_scale=1.0, vol_bump_abs=0.0, q=None)` | Monte Carlo pricer (antithetic variates only — no CV). `n_steps_per_obs` decouples Euler grid from averaging dates. `vol_scale` is a multiplicative bump on local vol; `vol_bump_abs` is an absolute parallel shift applied AFTER `vol_scale` to the diffusion (used by Vega in `compute_greeks`). `q` defaults to `vol_surface.q`. |
 | `.simulate(n_paths, antithetic=True)` | Returns spot at every averaging date, shape `(n, n_obs)`. |
-| `.price_asian(K, n_paths=100_000, call=True)` | Returns dict: `price, std_err, ci_95, n_paths`. Set `call=False` for puts. |
+| `.price_asian(K, n_paths=100_000, call=True, antithetic=True)` | Returns dict: `price, std_err, ci_95, n_paths`. Set `call=False` for puts. With `antithetic=True` (default) the SE is computed from pair averages `(f(Z) + f(-Z))/2` so the variance reduction is reflected; with `antithetic=False` the SE is the usual `std(payoff)/sqrt(n)`. |
 | `geometric_asian_call_price(S0, K, r, sigma, T, n_obs, call=True, q=0.0)` | Kemna-Vorst closed form. Drift uses $r-q$; discount uses $r$. Provided as a flat-vol benchmarking utility — not used internally by `price_asian`. |
 | `compute_greeks(S0, K, r, T, n_obs, vol_surface, local_vol_surface, n_paths=150_000, n_steps_per_obs=1, seed=42, call=True, q=None)` | Finite-difference Delta / Gamma / Vega / Theta under common random numbers. Pass `call=False` for put greeks. `q` defaults to `vol_surface.q`. Vega uses an absolute parallel vol shift on the diffusion. |
 
