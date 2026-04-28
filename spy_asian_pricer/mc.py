@@ -3,14 +3,6 @@
 Variance reduction:
     - Antithetic variates (paired ``Z`` and ``-Z`` draws).
 
-The Kemna & Vorst (1990) geometric-Asian control variate is intentionally
-NOT used: under a skewed local-vol surface the closed-form K-V target
-(which assumes GBM with a single flat ATM vol) systematically misses the
-true expectation of the geometric leg, and recentering it via a pilot MC
-costs more variance than it saves (see project notes).  The geometric
-closed form is still exposed as :func:`geometric_asian_call_price` for
-flat-vol benchmarking and unit tests, just not wired into ``price_asian``.
-
 Greeks (Delta, Gamma, Vega, Theta) are computed via finite-difference
 repricing under common random numbers.  Vega applies an absolute parallel
 shift (``vol_bump_abs``) directly to the local vol diffusion.
