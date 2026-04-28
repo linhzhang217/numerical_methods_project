@@ -154,6 +154,36 @@ def test_mc_one_obs_asian_matches_european():
     assert err < tol, f"MC ${res['price']:.4f} vs BS ${bs:.4f} (err={err:.4f}, tol={tol:.4f})"
 
 
+def test_antithetic_se_strictly_lower_than_plain():
+    """Antithetic SE should be strictly lower than plain MC SE at the same
+    n_paths on an ATM Asian (where f(Z) and f(-Z) are negatively correlated).
+    Verifies the pair-averaged SE formula in price_asian."""
+    spot, r, vol, T = 100.0, 0.04, 0.20, 0.5
+    surface = _build_flat_surface(spot=spot, r=r, vol=vol)
+    lv = DupireLocalVol(surface)
+    pricer = AsianMCPricer(
+        S0=spot, r=r, T=T, n_obs=26,
+        vol_surface=surface, local_vol_surface=lv,
+        n_steps_per_obs=1,
+    )
+    np.random.seed(123)
+    res_anti = pricer.price_asian(K=spot, n_paths=80_000, antithetic=True)
+    np.random.seed(123)
+    res_plain = pricer.price_asian(K=spot, n_paths=80_000, antithetic=False)
+
+    # SE should drop noticeably for ATM (typical 25-40% on ATM Asian)
+    assert res_anti["std_err"] < res_plain["std_err"], (
+        f"antithetic SE ({res_anti['std_err']:.4f}) should be < "
+        f"plain SE ({res_plain['std_err']:.4f}); the pair-averaged "
+        f"SE formula is broken."
+    )
+    se_ratio = res_anti["std_err"] / res_plain["std_err"]
+    assert se_ratio < 0.95, (
+        f"antithetic SE ratio {se_ratio:.3f} too close to 1 — "
+        f"variance reduction should be material on ATM"
+    )
+
+
 def test_mc_one_obs_asian_put_matches_european():
     """1-obs arithmetic Asian put = BS put."""
     spot = 100.0
