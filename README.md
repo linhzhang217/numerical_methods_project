@@ -53,30 +53,6 @@ $$w(y) = a + b\,\Bigl(\rho\,(y - m) + \sqrt{(y - m)^2 + \sigma^2}\Bigr)$$
 
 The five parameters $(a, b, \rho, m, \sigma)$ control the level, slope, asymmetry, location and convexity of the smile. SVI fits real equity-index smiles to within a few basis points and admits closed-form first and second derivatives — exactly what Dupire needs.
 
-### When to prefer SSVI over per-slice JWSVI
-
-[Gatheral (2014)] also introduced **SSVI**, a *surface*-level joint parameterisation:
-
-$$w(k, t) = \tfrac{\theta(t)}{2}\,\Bigl(1 + \rho\,\phi(\theta) k + \sqrt{(\phi(\theta) k + \rho)^2 + 1 - \rho^2}\Bigr),\quad \phi(\theta) = \eta\,\theta^{-\gamma}$$
-
-Three global parameters $(\eta, \rho, \gamma)$ + a discrete ATM term structure $\theta(t)$.  The surface is **calendar-arbitrage-free by construction** when $\theta$ is monotone non-decreasing and $\gamma\in[0, 1/2]$.
-
-This package ships SSVI as a peer to JWSVI (`spy_asian_pricer.SSVISurface` + `calibrate_ssvi`).  Two modes:
-
-- **`mode='pinned'`** (3 free params): $\theta(t_i)$ = market ATM total variance from each calibrated slice; only $(\eta, \rho, \gamma)$ optimised.  Fast, matches per-slice ATM exactly, but inherits ATM-IV noise.
-- **`mode='full'`** (3 + N free params): $\theta_i$ also optimised under the constraint $\theta_{i+1} \ge \theta_i$ (cumsum-of-squares parameterisation).  Smooths the term structure, slower, but full denoise.
-
-When to pick which:
-
-| Situation | Pick |
-|---|---|
-| Clean Bloomberg / vendor data, pricing per-tenor European vanillas | per-slice JWSVI (production default; preserves per-tenor flexibility, vega-bucket-friendly) |
-| Noisy Yahoo data, want surface clean by construction | SSVI `full` |
-| Want to reproduce a JWSVI surface as a baseline before SSVI | SSVI `pinned` (matches per-slice ATM) |
-| Path-dependent products (Asian, barrier) on noisy data | SSVI `full` (calendar-arb-free → cleaner Dupire) |
-
-At each fixed tenor SSVI reduces in closed form to a raw SVI slice, so an `SSVISurface` plugs into `DupireLocalVol` exactly like a `JWSVIVolSurface`.
-
 ### Why JWSVI for time interpolation?
 
 Raw SVI parameters $(a, b, \rho, m, \sigma)$ have no direct financial interpretation, so interpolating them across maturities is unstable. **Gatheral & Jacquier (2014)** introduced the **Jump-Wing** reparameterization (JWSVI), a mathematically equivalent 6-tuple $(\nu, \phi, p, c, \tilde\nu, \mathrm{conv})$ with clear meaning:
@@ -91,6 +67,32 @@ Raw SVI parameters $(a, b, \rho, m, \sigma)$ have no direct financial interpreta
 | $\mathrm{conv}$ | convexity |
 
 Because each parameter is a *financial* quantity, smooth time interpolation in JWSVI space produces a sensible, calendar-arbitrage-free surface even with sparse expiry coverage. We interpolate $(\nu T, \phi, p, c)$ linearly (cubic if $>3$ slices), and $\tilde\nu$ is re-derived from the wing slopes via $\tilde\nu = 4\nu p c / (p+c)^2$, then clipped to $[10^{-6},\, 0.99\,\nu]$ (the `NUTILDA_FLOOR` constant) so the SVI radius stays well-defined and $\nu - \tilde\nu \ge 0$ always.
+
+### Why SSVI for joint surface fitting?
+
+JWSVI fits each expiry independently and only checks calendar arbitrage *after the fact*. On Bloomberg-quality data with trader overrides this is fine, but on free-feed Yahoo chains adjacent slices routinely disagree enough that calendar arb leaks into the surface — and once that happens the Dupire numerator $\partial_T w$ goes negative and the local-vol grid has to clamp itself out of the corner. **Gatheral (2014) SSVI** removes the failure mode at the source by sharing skew/curvature across every tenor: only the ATM term structure $\theta(t)$ varies tenor-by-tenor, and three global parameters describe the smile shape everywhere.
+
+$$w(k, t) = \tfrac{\theta(t)}{2}\,\Bigl(1 + \rho\,\phi(\theta) k + \sqrt{(\phi(\theta) k + \rho)^2 + 1 - \rho^2}\Bigr),\quad \phi(\theta) = \eta\,\theta^{-\gamma}$$
+
+| Param | Meaning |
+|---|---|
+| $\eta$ | skew curvature scale (overall smile width) |
+| $\rho$ | global spot-vol correlation; equity skew is negative ($\rho < 0$ at every tenor) |
+| $\gamma \in [0, 1/2]$ | term-structure decay exponent on $\phi(\theta) = \eta\,\theta^{-\gamma}$; controls how the smile flattens with maturity |
+| $\theta(t)$ | ATM total variance term structure (one knot per calibrated tenor) |
+
+The surface is **calendar-arbitrage-free by construction** when $\theta(t)$ is monotone non-decreasing and $\gamma \in [0, 1/2]$ — both enforced by the calibrator. Total parameter count is $3 + N$ instead of JWSVI's $5 \times N$, and the $3$ globals give the optimiser strong noise rejection: a single bad call-wing quote on one slice can no longer flip the local skew sign because $\rho$ is shared across every tenor.
+
+At each fixed tenor SSVI reduces in *closed form* to a raw SVI slice (Gatheral & Jacquier 2014, Theorem 4.1), so an `SSVISurface` exposes the same `get_svi_at(dcf)` API as `JWSVIVolSurface` and plugs into `DupireLocalVol` unchanged.
+
+When to pick which:
+
+| Situation | Pick |
+|---|---|
+| Clean Bloomberg / vendor data, pricing per-tenor European vanillas | per-slice JWSVI (preserves per-tenor flexibility, vega-bucket-friendly) |
+| Noisy Yahoo data, want surface clean by construction | SSVI `full` |
+| Want to reproduce a JWSVI surface as a baseline before SSVI | SSVI `pinned` (matches per-slice ATM exactly) |
+| Path-dependent products (Asian, barrier) on noisy data | SSVI `full` (calendar-arb-free → cleaner Dupire) |
 
 ### Why three arbitrage checks?
 
@@ -152,6 +154,22 @@ Closed-form transformation, no fitting. The 5 raw SVI parameters map to the 6 JW
 - `conv` is recomputed for diagnostics but does NOT enter the SVI reconstruction.
 - The forward used by `implied_vol` / `total_variance` is $F = S\, e^{(r-q) T}$ (the dividend yield is stored on the surface).
 - This re-derivation makes the surface **lossy at calibrated knots**: feeding `svi_orig.to_jwsvi(t)` into the surface and reading it back via `get_svi_at(t)` does NOT round-trip exactly. The notebook ships a "surface stability check" cell that quantifies this gap on a sensible moneyness band ($|y|\le 0.1$) split by tenor bucket.
+
+### 4b. SSVI joint calibration (`ssvi.py`)
+
+`calibrate_ssvi` is an alternative to the per-slice SVI → JWSVI → time-interpolate path of §2-§4. Instead of fitting each slice independently and then interpolating, it solves *one* joint least-squares problem over the entire `(K, T)` cloud:
+
+$$\min_{\eta,\, \rho,\, \gamma,\, \theta(\cdot)}\; \sum_{i, j} w_{ij}\,\bigl[\, w_{\text{SSVI}}(k_{ij}, \theta(t_j);\; \eta, \rho, \gamma) \;-\; \sigma_{\text{iv},\,ij}^2\, t_j \,\bigr]^2$$
+
+with the same vega-like Gaussian weights $w_{ij} = \exp(-k_{ij}^2 / (2 \cdot 0.3^2))$ as the per-slice SVI fit. Implementation choices:
+
+- **Two modes** controlled by `mode=`:
+  - **`'pinned'` (3 free params, default)**: $\theta(t_i)$ is pinned to each slice's market ATM total variance ($\theta_i := \sigma_{\text{ATM},\,i}^2 \cdot t_i$, computed by linearly interpolating the input IV grid at the forward); only $(\eta, \rho, \gamma)$ are optimised. Fast (3 unknowns, L-BFGS-B converges in a few iterations) and matches per-slice ATM exactly, but inherits any noise in the ATM term structure.
+  - **`'full'` (3 + N free params)**: $\theta_1, \ldots, \theta_N$ are optimised jointly with $(\eta, \rho, \gamma)$.
+- **Monotone $\theta(t)$ via cumsum-of-squares**. Calendar-arb-free SSVI requires $\theta_{i+1} \ge \theta_i$. Rather than feeding L-BFGS-B a constrained problem, we reparameterise $\theta_i = \sum_{j \le i} d_j^2$ with the unbounded variables $d_j$ — squaring kills the sign and cumsum kills the monotonicity constraint, so the optimiser sees a fully unconstrained problem in the $d_j$. Initial guess is $d_j^{(0)} = \sqrt{\theta^{\text{ATM}}_j - \theta^{\text{ATM}}_{j-1}}$ from the pinned-mode init.
+- **Bounds** $\eta \in [0.01, 50]$, $\rho \in (-0.999, 0.999)$, $\gamma \in [0, 0.499]$ enforce calendar-arbitrage-free structure (the upper bound on $\gamma$ is the strict version of $\le 1/2$).
+- **Closed-form SSVI → SVI mapping at fixed $t$** (Gatheral & Jacquier 2014, Thm 4.1): $a = \tfrac{\theta(1-\rho^2)}{2}$, $b = \tfrac{\theta\,\phi}{2}$, $\rho_{\text{SVI}} = \rho$, $m = -\rho/\phi$, $\sigma = \sqrt{1 - \rho^2}/\phi$. This is what `get_svi_at(dcf)` returns, so `SSVISurface` plugs into `DupireLocalVol` via the same duck-typed contract as `JWSVIVolSurface`.
+- **`theta_at(dcf)`** linearly interpolates between the calibrated $\theta_i$ knots; below the first knot it clips at $\theta_1$ (no extrapolation toward zero where $\phi(\theta) = \eta\,\theta^{-\gamma}$ blows up).
 
 ### 5. Dupire local volatility (`dupire.py`)
 
