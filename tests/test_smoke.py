@@ -9,9 +9,17 @@ Builds a synthetic flat-IV vol grid, runs the full pipeline, and checks:
       are highly correlated, so the gap is small, ~10c on a $25 ATM 6M)
     * Asian MC price stays close (3*SE + 5c) to the European Black-Scholes
       price for a 1-observation Asian (which IS a European).
+    * Trading-day observation schedule skips weekends correctly.
+
+Tests that require uniform-in-T spacing (Kemna-Vorst comparison, 1-obs
+European equivalence) explicitly pass ``obs_schedule='calendar'`` because
+the new pricer default is ``'trading'`` (weekday calendar with weekend
+gaps), which would otherwise break those closed-form benchmarks.
 """
 
 from __future__ import annotations
+
+from datetime import date
 
 import numpy as np
 from scipy.stats import norm
@@ -25,6 +33,7 @@ from spy_asian_pricer import (
     calibrate_ssvi,
     calibrate_svi,
     geometric_asian_call_price,
+    trading_day_obs_dcfs,
 )
 from spy_asian_pricer.ssvi import _ssvi_w
 
@@ -111,6 +120,7 @@ def test_mc_asian_close_to_geometric_under_flat_vol():
         S0=spot, r=r, T=T, n_obs=n_obs,
         vol_surface=surface, local_vol_surface=lv,
         n_steps_per_obs=1,
+        obs_schedule="calendar",  # KV closed form assumes uniform spacing
     )
 
     np.random.seed(123)
@@ -132,7 +142,11 @@ def test_mc_asian_close_to_geometric_under_flat_vol():
 
 
 def test_mc_one_obs_asian_matches_european():
-    """A 1-observation arithmetic Asian IS a European. MC should match BS."""
+    """A 1-observation arithmetic Asian IS a European. MC should match BS.
+
+    Forces ``obs_schedule='calendar'`` so the single observation lands at
+    T (not at the next trading day, which would be only ~1-3 calendar
+    days away regardless of T)."""
     spot = 100.0
     r = 0.04
     vol = 0.20
@@ -144,6 +158,7 @@ def test_mc_one_obs_asian_matches_european():
         S0=spot, r=r, T=T, n_obs=1,
         vol_surface=surface, local_vol_surface=lv,
         n_steps_per_obs=20,
+        obs_schedule="calendar",
     )
     np.random.seed(7)
     res = pricer.price_asian(K=spot, n_paths=80_000)
@@ -157,7 +172,10 @@ def test_mc_one_obs_asian_matches_european():
 def test_antithetic_se_strictly_lower_than_plain():
     """Antithetic SE should be strictly lower than plain MC SE at the same
     n_paths on an ATM Asian (where f(Z) and f(-Z) are negatively correlated).
-    Verifies the pair-averaged SE formula in price_asian."""
+    Verifies the pair-averaged SE formula in price_asian.
+
+    Pinned to ``obs_schedule='calendar'`` so the result is reproducible
+    independently of what day of the week the test happens to run."""
     spot, r, vol, T = 100.0, 0.04, 0.20, 0.5
     surface = _build_flat_surface(spot=spot, r=r, vol=vol)
     lv = DupireLocalVol(surface)
@@ -165,6 +183,7 @@ def test_antithetic_se_strictly_lower_than_plain():
         S0=spot, r=r, T=T, n_obs=26,
         vol_surface=surface, local_vol_surface=lv,
         n_steps_per_obs=1,
+        obs_schedule="calendar",
     )
     np.random.seed(123)
     res_anti = pricer.price_asian(K=spot, n_paths=80_000, antithetic=True)
@@ -185,7 +204,9 @@ def test_antithetic_se_strictly_lower_than_plain():
 
 
 def test_mc_one_obs_asian_put_matches_european():
-    """1-obs arithmetic Asian put = BS put."""
+    """1-obs arithmetic Asian put = BS put.
+
+    Same calendar-mode pin as the call version above."""
     spot = 100.0
     r = 0.04
     vol = 0.20
@@ -197,6 +218,7 @@ def test_mc_one_obs_asian_put_matches_european():
         S0=spot, r=r, T=T, n_obs=1,
         vol_surface=surface, local_vol_surface=lv,
         n_steps_per_obs=20,
+        obs_schedule="calendar",
     )
     np.random.seed(7)
     res = pricer.price_asian(K=spot, n_paths=80_000, call=False)
@@ -206,6 +228,107 @@ def test_mc_one_obs_asian_put_matches_european():
     err = abs(res["price"] - bs_put)
     tol = 3.0 * res["std_err"] + 0.05
     assert err < tol, f"MC put ${res['price']:.4f} vs BS put ${bs_put:.4f} (err={err:.4f}, tol={tol:.4f})"
+
+
+# -------------------- Trading-day observation schedule --------------------
+
+def test_trading_day_obs_dcfs_skips_weekends():
+    """Five trading days starting from a Wednesday should land on
+    Thu (1d), Fri (2d), Mon (5d — weekend gap), Tue (6d), Wed (7d).
+    Spacing = [1, 1, 3, 1, 1] calendar days / 365."""
+    start = date(2024, 1, 3)  # Wednesday
+    obs = trading_day_obs_dcfs(5, start_date=start)
+    expected = np.array([1, 2, 5, 6, 7]) / 365.0
+    assert np.allclose(obs, expected, atol=1e-12), (obs, expected)
+    # And the per-interval gap pattern
+    intervals = np.diff(np.concatenate([[0.0], obs])) * 365.0
+    assert np.allclose(intervals, [1, 1, 3, 1, 1], atol=1e-9), intervals
+
+
+def test_trading_day_starting_friday_jumps_over_weekend_first():
+    """If the valuation date is a Friday, the first observation is
+    Monday (3 calendar days later), not Saturday."""
+    start = date(2024, 1, 5)  # Friday
+    obs = trading_day_obs_dcfs(3, start_date=start)
+    # Mon (3d), Tue (4d), Wed (5d)
+    expected = np.array([3, 4, 5]) / 365.0
+    assert np.allclose(obs, expected, atol=1e-12), (obs, expected)
+
+
+def test_pricer_trading_mode_overrides_T_with_last_obs():
+    """In trading mode, the pricer's T is taken from obs_dcfs[-1], not
+    the user-passed T (which is informational only)."""
+    spot, r, vol = 100.0, 0.04, 0.20
+    surface = _build_flat_surface(spot=spot, r=r, vol=vol)
+    lv = DupireLocalVol(surface)
+    pricer = AsianMCPricer(
+        S0=spot, r=r, T=0.5, n_obs=10,
+        vol_surface=surface, local_vol_surface=lv,
+        obs_schedule="trading",
+        start_date=date(2024, 1, 3),
+    )
+    # 10 trading days starting Wed 2024-01-03 ends on Wed 2024-01-17:
+    #   Thu(1) Fri(2) Mon(5) Tue(6) Wed(7) Thu(8) Fri(9) Mon(12) Tue(13) Wed(14)
+    # so T = 14 calendar days / 365.
+    expected_T = 14.0 / 365.0
+    assert abs(pricer.T - expected_T) < 1e-10, (pricer.T, expected_T)
+    assert pricer.n_obs == 10
+
+
+def test_pricer_explicit_obs_dcfs_overrides_T_and_schedule():
+    """Passing obs_dcfs directly should override both T and obs_schedule."""
+    spot, r, vol = 100.0, 0.04, 0.20
+    surface = _build_flat_surface(spot=spot, r=r, vol=vol)
+    lv = DupireLocalVol(surface)
+    custom = np.array([0.10, 0.20, 0.40])
+    pricer = AsianMCPricer(
+        S0=spot, r=r, T=999.0, n_obs=99,  # both ignored
+        vol_surface=surface, local_vol_surface=lv,
+        obs_dcfs=custom,
+        obs_schedule="trading",  # also ignored when obs_dcfs is given
+    )
+    assert pricer.n_obs == 3
+    assert abs(pricer.T - 0.40) < 1e-12
+    assert np.allclose(pricer.obs_dcfs, custom)
+
+
+def test_pricer_trading_default_runs_end_to_end():
+    """Smoke test that the trading-mode default actually prices something."""
+    spot, r, vol = 100.0, 0.04, 0.20
+    surface = _build_flat_surface(spot=spot, r=r, vol=vol)
+    lv = DupireLocalVol(surface)
+    pricer = AsianMCPricer(
+        S0=spot, r=r, T=0.5, n_obs=63,  # ~3M of trading days
+        vol_surface=surface, local_vol_surface=lv,
+    )
+    assert pricer.obs_schedule == "trading"
+    np.random.seed(7)
+    res = pricer.price_asian(K=spot, n_paths=20_000)
+    assert res["price"] > 0
+    assert res["std_err"] > 0
+
+
+def test_geometric_asian_with_explicit_obs_dcfs_matches_uniform():
+    """The generalised closed form should equal the uniform-spacing form
+    when fed uniform dcfs."""
+    S0, K, r, sigma, T, n_obs = 100.0, 100.0, 0.04, 0.20, 0.5, 26
+    p_uniform = geometric_asian_call_price(S0, K, r, sigma, T, n_obs)
+    obs_dcfs = np.linspace(T / n_obs, T, n_obs)
+    p_general = geometric_asian_call_price(S0, K, r, sigma, obs_dcfs=obs_dcfs)
+    assert abs(p_uniform - p_general) < 1e-10, (p_uniform, p_general)
+
+
+def test_geometric_asian_non_uniform_dcfs_runs():
+    """Non-uniform dcfs (trading-day spacing) should produce a sensible
+    price — between the uniform-spacing version and the European."""
+    S0, K, r, sigma = 100.0, 100.0, 0.04, 0.20
+    obs_dcfs = trading_day_obs_dcfs(126, start_date=date(2024, 1, 3))
+    p_trading = geometric_asian_call_price(S0, K, r, sigma, obs_dcfs=obs_dcfs)
+    p_uniform = geometric_asian_call_price(S0, K, r, sigma,
+                                            T=float(obs_dcfs[-1]), n_obs=126)
+    # Non-uniform schedule should be very close to uniform at same N and
+    # same T_eff (spacing differences are second-order in the variance sum).
+    assert abs(p_trading - p_uniform) < 0.05, (p_trading, p_uniform)
 
 
 # -------------------- SSVI --------------------
