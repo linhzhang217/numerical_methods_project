@@ -17,7 +17,12 @@ from .arbitrage import (
     filter_butterfly_arbitrage,
 )
 from .dupire import DupireLocalVol
-from .mc import AsianMCPricer, compute_greeks, geometric_asian_call_price
+from .mc import (
+    AsianMCPricer,
+    compute_greeks,
+    geometric_asian_call_price,
+    trading_day_obs_dcfs,
+)
 from .ssvi import SSVISurface, calibrate_ssvi
 from .surface import JWSVIVolSurface
 from .svi import JWSVIParam, SVIParam, calibrate_svi
@@ -48,6 +53,7 @@ __all__ = [
     "AsianMCPricer",
     "geometric_asian_call_price",
     "compute_greeks",
+    "trading_day_obs_dcfs",
     "check_butterfly_arbitrage",
     "check_calendar_arbitrage",
     "check_spread_arbitrage",
