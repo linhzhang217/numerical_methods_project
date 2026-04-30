@@ -200,6 +200,8 @@ $$S_{t + \Delta t} = S_t \exp\!\Bigl(\bigl(r - q - \tfrac{1}{2}\sigma_{\mathrm{l
 
 We sample $\sigma_{\mathrm{loc}}$ at the **midpoint** $t + \Delta t/2$ for $O(\Delta t^2)$ weak-error improvement. The averaging grid (`n_obs` dates) and simulation grid (`n_steps_per_obs` Euler sub-steps) are **decoupled** so coarse averaging (e.g. monthly) keeps a fine Euler step.
 
+**Observation schedule (trading-day default).** By default `AsianMCPricer` puts the `n_obs` averaging dates on the next `n_obs` weekdays after `start_date` (today by default), so consecutive intervals are 1 calendar day on weekday-to-weekday and 3 calendar days across a weekend. The Euler-Maruyama scheme uses the per-interval $\Delta t$, so a Friday-to-Monday gap is integrated with $\sqrt{3\,\Delta t_{\text{wd}}}$ Brownian increment — the correct scaling — instead of being mis-treated as a regular day. Holidays are *not* skipped (no built-in market calendar); for an exact NYSE schedule including holidays, build the dcfs externally (`pandas_market_calendars` or similar) and pass `obs_dcfs=` directly. In trading mode the user-supplied `T` is informational only; the effective maturity is taken from the last observation (e.g. 126 trading days from today on a Wednesday lands at $T \approx 176/365 \approx 0.482$, not exactly $0.5$). Pass `obs_schedule='calendar'` to recover legacy uniform-in-T spacing — required when comparing to the Kemna-Vorst closed form, which assumes uniform $t_i = i\,T/N$.
+
 **Antithetic variates.** For each Brownian draw $Z$ we also use $-Z$, doubling sample size at no extra cost and cancelling first-order symmetric noise.
 
 **No control variate.** See "Why no control variate?" above. The estimator is the plain antithetic average of discounted arithmetic payoffs:
@@ -313,7 +315,7 @@ Default threshold `-0.05` is conservative (only catastrophic fits). Tighten to `
 
 - **European-style only.** No early exercise.
 - **Single-asset.** No basket, spread, rainbow, or quanto Asians.
-- **Vanilla averaging.** Equal-weighted arithmetic mean over uniformly-spaced dates. No weighted averaging, no float-strike, no in-progress (already-observed) paths.
+- **Vanilla averaging.** Equal-weighted arithmetic mean. Default schedule is the next `n_obs` weekdays after the valuation date (1 calendar day apart on weekdays, 3 across weekends); pass `obs_schedule='calendar'` for uniform-in-T spacing, or `obs_dcfs=` for a custom (e.g. holiday-aware) schedule. No weighted averaging, no float-strike, no in-progress (already-observed) paths.
 
 ---
 
@@ -356,7 +358,12 @@ for exp_str, df in vol_data.items():
 surface = JWSVIVolSurface(jwsvi_slices, spot=spot, r=r, q=q)
 local_vol = DupireLocalVol(surface)        # inherits r, q
 
-# Price a 6-month ATM Asian call with daily averaging
+# Price a 6-month ATM Asian call with daily averaging.
+# Default obs_schedule='trading' puts the 126 observation dates on the
+# next 126 weekdays from today; the effective maturity becomes whatever
+# calendar dcf the 126th business day lands at (~0.48-0.50 depending on
+# the day of week today happens to be).  Pass obs_schedule='calendar'
+# to force exact T=0.5 and uniform spacing.
 T, n_obs = 0.5, 126
 pricer = AsianMCPricer(S0=spot, r=r, T=T, n_obs=n_obs,
                        vol_surface=surface, local_vol_surface=local_vol)  # q from surface
@@ -447,11 +454,12 @@ for exp, (jw, dcf) in jwsvi_slices.items():
 
 | Object | Description |
 |---|---|
-| `AsianMCPricer(S0, r, T, n_obs, vol_surface, local_vol_surface, n_steps_per_obs=1, vol_scale=1.0, vol_bump_abs=0.0, q=None)` | Monte Carlo pricer (antithetic variates only — no CV). `n_steps_per_obs` decouples Euler grid from averaging dates. `vol_scale` is a multiplicative bump on local vol; `vol_bump_abs` is an absolute parallel shift applied AFTER `vol_scale` to the diffusion (used by Vega in `compute_greeks`). `q` defaults to `vol_surface.q`. |
+| `AsianMCPricer(S0, r, T=None, n_obs=None, vol_surface, local_vol_surface, n_steps_per_obs=1, vol_scale=1.0, vol_bump_abs=0.0, q=None, obs_schedule='trading', obs_dcfs=None, start_date=None)` | Monte Carlo pricer (antithetic variates only — no CV). **Observation schedule**: `'trading'` (default) → next `n_obs` weekdays after `start_date` (today); `'calendar'` → uniform $t_i = i\,T/N$ (legacy behavior, required for KV closed-form comparison); `obs_dcfs=` → fully explicit (overrides everything else, `T` derived from `obs_dcfs[-1]`). `n_steps_per_obs` decouples Euler sub-steps from averaging dates and is applied per-interval, so weekend gaps get the correct $\sqrt{3\,\Delta t}$ scaling. `vol_scale` is multiplicative; `vol_bump_abs` is an absolute parallel shift applied AFTER `vol_scale` (used by Vega in `compute_greeks`). `q` defaults to `vol_surface.q`. |
 | `.simulate(n_paths, antithetic=True)` | Returns spot at every averaging date, shape `(n, n_obs)`. |
 | `.price_asian(K, n_paths=100_000, call=True, antithetic=True)` | Returns dict: `price, std_err, ci_95, n_paths`. Set `call=False` for puts. With `antithetic=True` (default) the SE is computed from pair averages `(f(Z) + f(-Z))/2` so the variance reduction is reflected; with `antithetic=False` the SE is the usual `std(payoff)/sqrt(n)`. |
-| `geometric_asian_call_price(S0, K, r, sigma, T, n_obs, call=True, q=0.0)` | Kemna-Vorst closed form. Drift uses $r-q$; discount uses $r$. Provided as a flat-vol benchmarking utility — not used internally by `price_asian`. |
-| `compute_greeks(S0, K, r, T, n_obs, vol_surface, local_vol_surface, n_paths=150_000, n_steps_per_obs=1, seed=42, call=True, q=None)` | Finite-difference Delta / Gamma / Vega / Theta under common random numbers. Pass `call=False` for put greeks. `q` defaults to `vol_surface.q`. Vega uses an absolute parallel vol shift on the diffusion. |
+| `trading_day_obs_dcfs(n_obs, start_date=None, calendar_basis=365.0)` | Calendar-year dcfs for the next `n_obs` weekdays after `start_date` (defaults to today). Holidays are NOT skipped — for an exact NYSE schedule build dcfs externally and pass via `obs_dcfs=`. |
+| `geometric_asian_call_price(S0, K, r, sigma, T=None, n_obs=None, call=True, q=0.0, *, obs_dcfs=None)` | Kemna-Vorst closed form. Drift uses $r-q$; discount uses $r$. Two calling conventions: `(T, n_obs)` for the legacy uniform-spacing formula, or `obs_dcfs=` for arbitrary $t_i$ via $\mu_G T = (r-q-\sigma^2/2)\bar t + \sigma_G^2 T/2$ and $\sigma_G^2 T = (\sigma^2/N^2)\sum_{i,j}\min(t_i, t_j)$. Provided as a flat-vol benchmarking utility — not used internally by `price_asian`. |
+| `compute_greeks(S0, K, r, T, n_obs, vol_surface, local_vol_surface, n_paths=150_000, n_steps_per_obs=1, seed=42, call=True, q=None, obs_schedule='trading', obs_dcfs=None, start_date=None)` | Finite-difference Delta / Gamma / Vega / Theta under common random numbers. Observation schedule is resolved once and reused across bumps so CRN holds exactly; theta shifts the entire schedule by -1 calendar day. Pass `call=False` for put greeks. `q` defaults to `vol_surface.q`. Vega uses an absolute parallel vol shift on the diffusion. |
 
 ### Arbitrage diagnostics
 
